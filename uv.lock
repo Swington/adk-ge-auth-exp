@@ -8,17 +8,33 @@ resolution-markers = [
 ]
 
 [[package]]
+name = "a2a-sdk"
+version = "0.3.22"
+source = { registry = "https://pypi.org/simple/" }
+dependencies = [
+    { name = "google-api-core" },
+    { name = "httpx" },
+    { name = "httpx-sse" },
+    { name = "protobuf" },
+    { name = "pydantic" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/92/a3/76f2d94a32a1b0dc760432d893a09ec5ed31de5ad51b1ef0f9d199ceb260/a2a_sdk-0.3.22.tar.gz", hash = "sha256:77a5694bfc4f26679c11b70c7f1062522206d430b34bc1215cfbb1eba67b7e7d", size = 231535, upload-time = "2025-12-16T18:39:21.19Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/64/e8/f4e39fd1cf0b3c4537b974637143f3ebfe1158dad7232d9eef15666a81ba/a2a_sdk-0.3.22-py3-none-any.whl", hash = "sha256:b98701135bb90b0ff85d35f31533b6b7a299bf810658c1c65f3814a6c15ea385", size = 144347, upload-time = "2025-12-16T18:39:19.218Z" },
+]
+
+[[package]]
 name = "adk-auth-exp"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
-    { name = "google-adk" },
+    { name = "google-adk", extra = ["a2a"] },
     { name = "google-cloud-spanner" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "google-adk", specifier = ">=1.24.0" },
+    { name = "google-adk", extras = ["a2a"], specifier = ">=1.24.0" },
     { name = "google-cloud-spanner", specifier = ">=3.0.0" },
 ]
 
@@ -390,6 +406,11 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/44/d4/067ff47a8e485059cea5f5222a35ae59d739a0db313d6f19fd5b61f1b9df/google_adk-1.24.1.tar.gz", hash = "sha256:f61cdbc2aedaac691d98f66e5c18b133c5d7d8a3f66658dbf0eac2bea99060f3", size = 2209820, upload-time = "2026-02-06T18:55:33.942Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d6/46/0d07a161882f2890d5bb98b99473d0e31856825185b4cdbade6dee3a4bb7/google_adk-1.24.1-py3-none-any.whl", hash = "sha256:8a05014fa0c95b34dc0995b5fc6511bff651835c82d8549a33c5e8c20e727bc4", size = 2563511, upload-time = "2026-02-06T18:55:31.791Z" },
+]
+
+[package.optional-dependencies]
+a2a = [
+    { name = "a2a-sdk" },
 ]
 
 [[package]]
