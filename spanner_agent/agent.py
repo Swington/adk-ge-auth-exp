@@ -1,30 +1,22 @@
 """ADK Agent with Spanner Toolkit for auth propagation experiment."""
 
+import logging
 import os
 
-import google.auth
 from google.adk.agents import Agent
 from google.adk.tools.spanner.settings import Capabilities, SpannerToolSettings
-from google.adk.tools.spanner.spanner_credentials import SpannerCredentialsConfig
-from google.adk.tools.spanner.spanner_toolset import SpannerToolset
+
+from spanner_agent.auth_wrapper import USER_SA_MAP, ImpersonatingSpannerToolset
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT", "switon-gsd-demos")
 SPANNER_INSTANCE_ID = os.environ.get("SPANNER_INSTANCE_ID", "adk-auth-exp")
 SPANNER_DATABASE_ID = os.environ.get("SPANNER_DATABASE_ID", "demo-db")
 
-# Use Application Default Credentials.
-# When deployed to Cloud Run, this uses the service account's identity.
-# For user access propagation testing, the agent is invoked with the
-# user's own credentials via the OAuth flow.
-credentials, _ = google.auth.default(
-    scopes=[
-        "https://www.googleapis.com/auth/spanner.data",
-        "https://www.googleapis.com/auth/spanner.admin",
-    ]
-)
-
-spanner_toolset = SpannerToolset(
-    credentials_config=SpannerCredentialsConfig(credentials=credentials),
+spanner_toolset = ImpersonatingSpannerToolset(
+    user_sa_map=USER_SA_MAP,
     spanner_tool_settings=SpannerToolSettings(
         capabilities=[Capabilities.DATA_READ],
         max_executed_query_result_rows=100,
