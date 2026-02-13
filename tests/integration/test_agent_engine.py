@@ -103,36 +103,82 @@ def _extract_text(events: list[dict]) -> str:
     return " ".join(texts)
 
 
+def _extract_tool_results(events: list[dict]) -> list[dict]:
+    """Extract tool call results from events for error checking."""
+    results = []
+    for event in events:
+        if "events" in event:
+            for e in event["events"]:
+                # Check for function responses (tool results)
+                content = e.get("content", {})
+                parts = content.get("parts", [])
+                for part in parts:
+                    if "function_response" in part:
+                        results.append(part["function_response"])
+    return results
+
+
+def _assert_no_getddl_errors(text: str, tool_results: list[dict]):
+    """Assert no getDdl permission errors appear anywhere in the response.
+
+    This is the key assertion that catches the broken getDdl issue.
+    If Database.database_dialect triggers reload() → getDdl, the error
+    message will contain 'getDdl' or 'get_database_ddl'.
+    """
+    text_lower = text.lower()
+    assert "getddl" not in text_lower, (
+        f"getDdl permission error found in agent response: {text[:500]}"
+    )
+    assert "get_database_ddl" not in text_lower, (
+        f"get_database_ddl error found in agent response: {text[:500]}"
+    )
+    for result in tool_results:
+        result_str = json.dumps(result).lower()
+        assert "getddl" not in result_str, (
+            f"getDdl error in tool result: {result}"
+        )
+
+
 class TestAgentEngineUserIsolation:
     """Test that each user gets correct access level on Agent Engine."""
 
     def test_user1_full_access(self):
-        """User 1 (full access) can list tables and query data."""
+        """User 1 (full access) can list tables and query data without errors."""
         token = _get_impersonated_token(USER1_SA)
         events = _call_agent_engine(token, "List all tables in the database")
         text = _extract_text(events)
+        tool_results = _extract_tool_results(events)
+
+        # No getDdl errors should appear
+        _assert_no_getddl_errors(text, tool_results)
+
         # User 1 should see tables
         assert "employees" in text.lower() or "salaries" in text.lower(), (
-            f"User 1 should have full access. Got: {text[:500]}"
+            f"User 1 should have full access and see table names. Got: {text[:500]}"
         )
 
     def test_user2_no_access(self):
-        """User 2 (no access) gets a permission error."""
+        """User 2 (no access) gets a permission error (but NOT getDdl)."""
         token = _get_impersonated_token(USER2_SA)
         events = _call_agent_engine(token, "List all tables in the database")
         text = _extract_text(events)
-        # User 2 should get a permission error
+        # User 2 should get a Spanner data access error, not a getDdl error
         assert "permission" in text.lower() or "denied" in text.lower() or "error" in text.lower(), (
             f"User 2 should get permission denied. Got: {text[:500]}"
         )
 
     def test_user3_fgac_employees_only(self):
-        """User 3 (FGAC) can read employees but not salaries."""
+        """User 3 (FGAC) can read employees without getDdl errors."""
         token = _get_impersonated_token(USER3_SA)
         events = _call_agent_engine(
             token, "Query all data from the employees table"
         )
         text = _extract_text(events)
+        tool_results = _extract_tool_results(events)
+
+        # No getDdl errors should appear
+        _assert_no_getddl_errors(text, tool_results)
+
         # User 3 should see employee data
         assert "employee" in text.lower() or "name" in text.lower(), (
             f"User 3 should see employees. Got: {text[:500]}"

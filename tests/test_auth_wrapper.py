@@ -32,6 +32,8 @@ from spanner_agent.auth_wrapper import (
     set_bearer_token,
 )
 
+import google.cloud.spanner_v1.database
+
 FAKE_TOKEN = "test-fake-access-token-for-unit-testing-1234567890"
 
 
@@ -496,6 +498,41 @@ class TestResolveProjectId(unittest.TestCase):
 
     def test_returns_empty_string_unchanged(self):
         self.assertEqual(_resolve_project_id(""), "")
+
+
+class TestDatabaseDialectPropertyPatch(unittest.TestCase):
+    """Verify Database.database_dialect property never triggers getDdl.
+
+    The Spanner client's Database.database_dialect property calls reload()
+    when dialect is DATABASE_DIALECT_UNSPECIFIED, which requires the
+    spanner.databases.getDdl IAM permission. FGAC roles and user-scoped
+    OAuth credentials typically lack this permission.
+
+    Our patch makes the property return GOOGLE_STANDARD_SQL instead of
+    calling reload() when the dialect is unspecified.
+    """
+
+    def test_property_returns_google_standard_sql_when_unspecified(self):
+        """When _database_dialect is UNSPECIFIED, property returns GOOGLE_STANDARD_SQL."""
+        db = MagicMock(spec=google.cloud.spanner_v1.database.Database)
+        db._database_dialect = DatabaseDialect.DATABASE_DIALECT_UNSPECIFIED
+        # Call the actual patched property (bound to the class)
+        result = google.cloud.spanner_v1.database.Database.database_dialect.fget(db)
+        self.assertEqual(result, DatabaseDialect.GOOGLE_STANDARD_SQL)
+
+    def test_property_returns_explicit_dialect_unchanged(self):
+        """When _database_dialect is explicitly set, property returns it unchanged."""
+        db = MagicMock(spec=google.cloud.spanner_v1.database.Database)
+        db._database_dialect = DatabaseDialect.GOOGLE_STANDARD_SQL
+        result = google.cloud.spanner_v1.database.Database.database_dialect.fget(db)
+        self.assertEqual(result, DatabaseDialect.GOOGLE_STANDARD_SQL)
+
+    def test_property_does_not_call_reload(self):
+        """The patched property never calls reload(), even when dialect is UNSPECIFIED."""
+        db = MagicMock(spec=google.cloud.spanner_v1.database.Database)
+        db._database_dialect = DatabaseDialect.DATABASE_DIALECT_UNSPECIFIED
+        google.cloud.spanner_v1.database.Database.database_dialect.fget(db)
+        db.reload.assert_not_called()
 
 
 class TestMiddlewareDatabaseRole(unittest.TestCase):

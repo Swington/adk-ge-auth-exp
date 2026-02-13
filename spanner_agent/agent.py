@@ -6,12 +6,18 @@ import os
 from google.adk.agents import Agent
 from google.adk.tools.spanner.settings import Capabilities, SpannerToolSettings
 
-from .auth_wrapper import BearerTokenSpannerToolset, normalize_project_id_callback
+from .auth_wrapper import (
+    BearerTokenSpannerToolset,
+    _resolve_project_id,
+    normalize_project_id_callback,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT", "switon-gsd-demos")
+PROJECT_ID = _resolve_project_id(
+    os.environ.get("GOOGLE_CLOUD_PROJECT", "switon-gsd-demos")
+)
 SPANNER_INSTANCE_ID = os.environ.get("SPANNER_INSTANCE_ID", "adk-auth-exp")
 SPANNER_DATABASE_ID = os.environ.get("SPANNER_DATABASE_ID", "demo-db")
 

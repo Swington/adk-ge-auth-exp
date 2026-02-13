@@ -39,6 +39,7 @@ from typing import Any, Dict, List, Optional, Union
 import os
 
 import google.auth
+import google.cloud.spanner_v1.database
 import google.cloud.spanner_v1.instance
 import google.oauth2.credentials
 import httpx
@@ -155,6 +156,33 @@ def _patched_instance_database(self, database_id, *args, **kwargs):
 
 
 _Instance.database = _patched_instance_database
+
+
+# ---------------------------------------------------------------------------
+# Monkey-patch Database.database_dialect to avoid getDdl on every access
+# ---------------------------------------------------------------------------
+# The upstream Spanner client's ``Database.database_dialect`` property calls
+# ``self.reload()`` whenever ``_database_dialect`` is
+# ``DATABASE_DIALECT_UNSPECIFIED``.  ``reload()`` triggers
+# ``get_database_ddl()`` which requires ``spanner.databases.getDdl`` — a
+# permission that user-scoped OAuth tokens and FGAC database roles typically
+# lack.
+#
+# The ``Instance.database()`` patch above pre-sets the dialect via the
+# constructor kwarg, but as a defence-in-depth measure we also patch the
+# *property* itself so that even if a ``Database`` object is created through
+# a path we don't control, the property never calls ``reload()``.
+_Database = google.cloud.spanner_v1.database.Database
+
+
+def _safe_database_dialect(self):
+    """Return the database dialect without triggering ``reload()``."""
+    if self._database_dialect == DatabaseDialect.DATABASE_DIALECT_UNSPECIFIED:
+        return DatabaseDialect.GOOGLE_STANDARD_SQL
+    return self._database_dialect
+
+
+_Database.database_dialect = property(_safe_database_dialect)
 
 
 # ---------------------------------------------------------------------------
