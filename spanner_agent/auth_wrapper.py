@@ -73,43 +73,14 @@ _current_database_role: contextvars.ContextVar[Optional[str]] = (
 )
 
 
-def _revoke_token(token: str) -> None:
-    """Revoke an OAuth token to force re-authorization.
-
-    Revoking an access token also revokes the associated refresh token,
-    which forces the client (Gemini Enterprise) to re-run the OAuth
-    consent flow — this time with the updated scopes (including email).
-    """
-    try:
-        resp = httpx.post(
-            "https://oauth2.googleapis.com/revoke",
-            params={"token": token},
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            timeout=5.0,
-        )
-        logger.info(
-            "[AUTH-MIDDLEWARE] Token revocation response: status=%d",
-            resp.status_code,
-        )
-    except Exception as exc:
-        logger.warning("[AUTH-MIDDLEWARE] Token revocation failed: %s", exc)
-
-
-def _resolve_user_email(token: str) -> tuple[Optional[str], bool]:
+def _resolve_user_email(token: str) -> Optional[str]:
     """Resolve the user's email from an OAuth access token.
 
     Tries two endpoints:
     1. tokeninfo (works when token has email scope)
     2. userinfo (works when token has email or openid scope)
-
-    Returns:
-        (email, needs_revocation) — email is the resolved email or None;
-        needs_revocation is True if the token lacks the email scope and
-        should be revoked AFTER the request completes to force
-        re-authorization with updated scopes.
     """
     # Try tokeninfo first
-    token_scope = None
     try:
         resp = httpx.get(
             "https://www.googleapis.com/oauth2/v3/tokeninfo",
@@ -118,11 +89,10 @@ def _resolve_user_email(token: str) -> tuple[Optional[str], bool]:
         )
         if resp.status_code == 200:
             data = resp.json()
-            token_scope = data.get("scope", "")
             logger.info(
                 "[AUTH-MIDDLEWARE] tokeninfo response keys=%s scope=%r",
                 list(data.keys()),
-                token_scope,
+                data.get("scope", ""),
             )
             email = data.get("email")
             if email:
@@ -130,7 +100,7 @@ def _resolve_user_email(token: str) -> tuple[Optional[str], bool]:
                     "[AUTH-MIDDLEWARE] Resolved token to email=%s via tokeninfo",
                     email,
                 )
-                return email, False
+                return email
             logger.info(
                 "[AUTH-MIDDLEWARE] tokeninfo has no email field, trying userinfo"
             )
@@ -159,7 +129,7 @@ def _resolve_user_email(token: str) -> tuple[Optional[str], bool]:
                     "[AUTH-MIDDLEWARE] Resolved token to email=%s via userinfo",
                     email,
                 )
-                return email, False
+                return email
             logger.info("[AUTH-MIDDLEWARE] userinfo has no email field either")
         else:
             logger.warning(
@@ -168,20 +138,8 @@ def _resolve_user_email(token: str) -> tuple[Optional[str], bool]:
     except Exception as exc:
         logger.warning("[AUTH-MIDDLEWARE] userinfo call failed: %s", exc)
 
-    # Flag for revocation if the token lacks the email scope — the caller
-    # must revoke AFTER the request completes (not before, because the
-    # token is still needed for Spanner API calls in this request).
-    needs_revocation = token_scope is not None and "email" not in token_scope
-    if needs_revocation:
-        logger.warning(
-            "[AUTH-MIDDLEWARE] Token lacks email scope (scope=%r). "
-            "Will revoke AFTER request to force re-authorization.",
-            token_scope,
-        )
-    else:
-        logger.warning("[AUTH-MIDDLEWARE] Could not resolve email from token")
-
-    return None, needs_revocation
+    logger.warning("[AUTH-MIDDLEWARE] Could not resolve email from token")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +250,7 @@ class AuthTokenExtractorMiddleware:
 
             # Resolve user email and set database_role for FGAC
             db_role = None
-            email, needs_revocation = _resolve_user_email(token)
+            email = _resolve_user_email(token)
             if email:
                 db_role = USER_DATABASE_ROLE_MAP.get(email)
                 if db_role:
@@ -308,12 +266,6 @@ class AuthTokenExtractorMiddleware:
             finally:
                 _current_bearer_token.reset(reset_token)
                 _current_database_role.reset(reset_role)
-                # Revoke stale tokens AFTER the request so Spanner calls
-                # still work in this request.  Revoking also invalidates
-                # the refresh token, forcing Gemini Enterprise to
-                # re-authorize with the updated scopes on the next request.
-                if needs_revocation:
-                    _revoke_token(token)
         else:
             auth_value = headers.get(b"authorization", b"").decode()
             if auth_value:
