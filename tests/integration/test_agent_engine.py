@@ -21,7 +21,7 @@ from vertexai.agent_engines import AdkApp
 
 PROJECT_ID = "switon-gsd-demos"
 REGION = "us-central1"
-AGENT_ENGINE_ID = "954924749211828224"
+AGENT_ENGINE_ID = "5919158175969312768"
 
 # Service accounts used for impersonation to simulate workspace users
 USER1_SA = "user1-full-access@switon-gsd-demos.iam.gserviceaccount.com"
@@ -122,8 +122,8 @@ def _assert_no_getddl_errors(text: str, tool_results: list[dict]):
     """Assert no getDdl permission errors appear anywhere in the response.
 
     This is the key assertion that catches the broken getDdl issue.
-    If Database.database_dialect triggers reload() → getDdl, the error
-    message will contain 'getDdl' or 'get_database_ddl'.
+    Checks for various forms of the getDdl error string in both the
+    agent's text response and in individual tool results.
     """
     text_lower = text.lower()
     assert "getddl" not in text_lower, (
@@ -132,15 +132,27 @@ def _assert_no_getddl_errors(text: str, tool_results: list[dict]):
     assert "get_database_ddl" not in text_lower, (
         f"get_database_ddl error found in agent response: {text[:500]}"
     )
+    # Also check for the IAM permission string format
+    assert "spanner.databases.getddl" not in text_lower, (
+        f"spanner.databases.getDdl permission error in response: {text[:500]}"
+    )
     for result in tool_results:
         result_str = json.dumps(result).lower()
         assert "getddl" not in result_str, (
             f"getDdl error in tool result: {result}"
         )
+        assert "get_database_ddl" not in result_str, (
+            f"get_database_ddl error in tool result: {result}"
+        )
 
 
 class TestAgentEngineUserIsolation:
-    """Test that each user gets correct access level on Agent Engine."""
+    """Test that each user gets correct access level on Agent Engine.
+
+    EVERY test checks for getDdl errors — this is the critical assertion
+    that catches the broken getDdl issue regardless of which test user
+    is being tested.
+    """
 
     def test_user1_full_access(self):
         """User 1 (full access) can list tables and query data without errors."""
@@ -148,6 +160,9 @@ class TestAgentEngineUserIsolation:
         events = _call_agent_engine(token, "List all tables in the database")
         text = _extract_text(events)
         tool_results = _extract_tool_results(events)
+
+        print(f"\n[User 1] Agent response text:\n{text[:1000]}")
+        print(f"[User 1] Tool results: {json.dumps(tool_results, indent=2)[:1000]}")
 
         # No getDdl errors should appear
         _assert_no_getddl_errors(text, tool_results)
@@ -162,7 +177,15 @@ class TestAgentEngineUserIsolation:
         token = _get_impersonated_token(USER2_SA)
         events = _call_agent_engine(token, "List all tables in the database")
         text = _extract_text(events)
-        # User 2 should get a Spanner data access error, not a getDdl error
+        tool_results = _extract_tool_results(events)
+
+        print(f"\n[User 2] Agent response text:\n{text[:1000]}")
+        print(f"[User 2] Tool results: {json.dumps(tool_results, indent=2)[:1000]}")
+
+        # CRITICAL: even User 2 should NOT see getDdl errors
+        _assert_no_getddl_errors(text, tool_results)
+
+        # User 2 should get a Spanner data access error
         assert "permission" in text.lower() or "denied" in text.lower() or "error" in text.lower(), (
             f"User 2 should get permission denied. Got: {text[:500]}"
         )
@@ -175,6 +198,9 @@ class TestAgentEngineUserIsolation:
         )
         text = _extract_text(events)
         tool_results = _extract_tool_results(events)
+
+        print(f"\n[User 3 employees] Agent response text:\n{text[:1000]}")
+        print(f"[User 3 employees] Tool results: {json.dumps(tool_results, indent=2)[:1000]}")
 
         # No getDdl errors should appear
         _assert_no_getddl_errors(text, tool_results)
@@ -191,6 +217,14 @@ class TestAgentEngineUserIsolation:
             token, "Query all data from the salaries table"
         )
         text = _extract_text(events)
+        tool_results = _extract_tool_results(events)
+
+        print(f"\n[User 3 salaries] Agent response text:\n{text[:1000]}")
+        print(f"[User 3 salaries] Tool results: {json.dumps(tool_results, indent=2)[:1000]}")
+
+        # CRITICAL: even on denied access, should NOT see getDdl errors
+        _assert_no_getddl_errors(text, tool_results)
+
         # User 3 should get an error on salaries
         assert "permission" in text.lower() or "denied" in text.lower() or "error" in text.lower() or "access" in text.lower(), (
             f"User 3 should be denied salaries. Got: {text[:500]}"

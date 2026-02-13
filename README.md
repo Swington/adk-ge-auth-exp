@@ -69,7 +69,7 @@ Gemini Enterprise / AgentSpace
 | Cloud Run service | `adk-spanner-agent` (us-central1) |
 | Cloud Run URL | `https://adk-spanner-agent-535816463745.us-central1.run.app` |
 | Cloud Run SA | `adk-spanner-agent@switon-gsd-demos.iam.gserviceaccount.com` (no Spanner access) |
-| Agent Engine | `projects/535816463745/locations/us-central1/reasoningEngines/954924749211828224` |
+| Agent Engine | `projects/535816463745/locations/us-central1/reasoningEngines/5919158175969312768` |
 | Spanner instance | `adk-auth-exp` (us-central1) |
 | Spanner database | `demo-db` |
 
