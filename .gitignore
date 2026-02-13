@@ -25,3 +25,6 @@ spanner_agent/.adk/
 
 # Logs
 *.log
+
+# ADK deploy temp folders
+spanner_agent_tmp*/

@@ -7,6 +7,7 @@ Tests the auth pipeline:
 4. BearerTokenSpannerToolset replaces _credentials_manager on tools
 5. FGAC database_role ContextVar and USER_DATABASE_ROLE_MAP
 6. Middleware sets database_role based on resolved email
+7. Agent Engine path: token from tool_context.state + lazy FGAC resolution
 """
 
 import asyncio
@@ -403,6 +404,102 @@ class TestMiddlewareDatabaseRole(unittest.TestCase):
         }
         _run(middleware(scope, None, None))
         self.assertIsNone(captured["role"])
+
+
+# --------------------------------------------------------------------------
+# Agent Engine path: token from tool_context.state
+# --------------------------------------------------------------------------
+class TestCredentialsManagerFromState(unittest.TestCase):
+    """BearerTokenCredentialsManager reads token from tool_context.state
+    when ContextVar is empty (Agent Engine deployment path).
+    """
+
+    def setUp(self):
+        self.manager = BearerTokenCredentialsManager()
+
+    def tearDown(self):
+        _current_bearer_token.set(None)
+        _current_database_role.set(None)
+
+    def test_reads_token_from_state(self):
+        """When ContextVar is empty, reads token from tool_context.state."""
+        ctx = _make_tool_context("user@example.com")
+        ctx.state = {"my_auth_resource": FAKE_TOKEN}
+        creds = _run(self.manager.get_valid_credentials(ctx))
+        self.assertIsNotNone(creds)
+        self.assertEqual(creds.token, FAKE_TOKEN)
+
+    def test_contextvar_takes_priority_over_state(self):
+        """ContextVar (Cloud Run) takes priority over state (Agent Engine)."""
+        set_bearer_token("contextvar-token")
+        ctx = _make_tool_context("user@example.com")
+        ctx.state = {"my_auth_resource": "state-token"}
+        creds = _run(self.manager.get_valid_credentials(ctx))
+        self.assertEqual(creds.token, "contextvar-token")
+
+    def test_returns_none_when_state_empty(self):
+        ctx = _make_tool_context("user@example.com")
+        ctx.state = {}
+        creds = _run(self.manager.get_valid_credentials(ctx))
+        self.assertIsNone(creds)
+
+    def test_returns_none_when_no_tool_context(self):
+        creds = _run(self.manager.get_valid_credentials(None))
+        self.assertIsNone(creds)
+
+    def test_skips_non_string_state_values(self):
+        ctx = _make_tool_context("user@example.com")
+        ctx.state = {"counter": 42, "flag": True}
+        creds = _run(self.manager.get_valid_credentials(ctx))
+        self.assertIsNone(creds)
+
+    def test_skips_short_string_state_values(self):
+        """Short strings are not access tokens."""
+        ctx = _make_tool_context("user@example.com")
+        ctx.state = {"status": "ok", "mode": "read"}
+        creds = _run(self.manager.get_valid_credentials(ctx))
+        self.assertIsNone(creds)
+
+    @patch("spanner_agent.auth_wrapper._resolve_user_email")
+    def test_sets_fgac_role_from_state_token(self, mock_resolve):
+        """Agent Engine path: resolves email and sets database_role.
+
+        ContextVar changes inside an asyncio Task are isolated, so we
+        capture the value inside the coroutine.
+        """
+        mock_resolve.return_value = "adk-auth-exp-3@switon.altostrat.com"
+        ctx = _make_tool_context("user@example.com")
+        ctx.state = {"my_auth_resource": FAKE_TOKEN}
+
+        async def run_and_capture():
+            creds = await self.manager.get_valid_credentials(ctx)
+            return creds, _current_database_role.get()
+
+        creds, role = _run(run_and_capture())
+        self.assertIsNotNone(creds)
+        self.assertEqual(role, "employees_reader")
+
+    @patch("spanner_agent.auth_wrapper._resolve_user_email")
+    def test_no_fgac_role_for_regular_user_from_state(self, mock_resolve):
+        mock_resolve.return_value = "adk-auth-exp-1@switon.altostrat.com"
+        ctx = _make_tool_context("user@example.com")
+        ctx.state = {"my_auth_resource": FAKE_TOKEN}
+
+        async def run_and_capture():
+            await self.manager.get_valid_credentials(ctx)
+            return _current_database_role.get()
+
+        role = _run(run_and_capture())
+        self.assertIsNone(role)
+
+    @patch("spanner_agent.auth_wrapper._resolve_user_email")
+    def test_skips_fgac_when_contextvar_already_set(self, mock_resolve):
+        """Cloud Run path: middleware already set the role, don't re-resolve."""
+        set_bearer_token(FAKE_TOKEN)
+        _current_database_role.set("employees_reader")
+        ctx = _make_tool_context("user@example.com")
+        _run(self.manager.get_valid_credentials(ctx))
+        mock_resolve.assert_not_called()
 
 
 if __name__ == "__main__":

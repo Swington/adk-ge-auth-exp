@@ -1,21 +1,24 @@
 """Bearer token credential propagation for SpannerToolset.
 
-When Gemini Enterprise invokes the agent via A2A, it includes the end-user's
-OAuth access token.  On Cloud Run (where ``Authorization`` is consumed by
-Cloud Run's own IAM check), the token arrives in ``X-User-Authorization``.
+Supports two deployment modes:
 
-Header priority (first match wins):
-    1. ``X-User-Authorization: Bearer <token>``   – Cloud Run
-    2. ``Authorization: Bearer <token>``           – local / direct calls
+**Cloud Run** (A2A protocol):
+    The end-user's OAuth access token arrives in HTTP headers.
+    ``AuthTokenExtractorMiddleware`` extracts it into a ContextVar.
+
+**Agent Engine** (Vertex AI managed runtime):
+    The token arrives via the ``authorizations`` field in the request JSON.
+    ``AdkApp._init_session`` stores it in ``session.state[auth_id]``.
+    The credentials manager reads it from ``tool_context.state``.
 
 Components:
 
-1.  **AuthTokenExtractorMiddleware** — ASGI middleware that extracts the Bearer
-    token and stores it in a ``contextvars.ContextVar``.
+1.  **AuthTokenExtractorMiddleware** — ASGI middleware (Cloud Run only) that
+    extracts the Bearer token and stores it in a ContextVar.
 
 2.  **BearerTokenCredentialsManager** — drop-in replacement for ADK's
-    ``GoogleCredentialsManager``; reads the token from the ContextVar and
-    returns ``google.oauth2.credentials.Credentials(token=...)``.
+    ``GoogleCredentialsManager``; reads the token from the ContextVar
+    (Cloud Run) or ``tool_context.state`` (Agent Engine).
 
 3.  **BearerTokenSpannerToolset** — ``BaseToolset`` wrapper that creates an
     inner ``SpannerToolset`` and replaces ``_credentials_manager`` on every
@@ -207,23 +210,76 @@ class AuthTokenExtractorMiddleware:
             _current_database_role.reset(reset_role)
 
 
+# Min length for a value to be considered an OAuth access token
+_MIN_TOKEN_LENGTH = 20
+
+
+def _resolve_and_set_database_role(token: str) -> None:
+    """Resolve user email from token and set the FGAC database_role ContextVar.
+
+    Called lazily by the credential manager in Agent Engine mode (where no
+    middleware has set the role).  Skipped if the role is already set
+    (Cloud Run mode — the middleware already resolved it).
+    """
+    if _current_database_role.get() is not None:
+        return  # already set (by middleware or earlier call)
+    email = _resolve_user_email(token)
+    if email:
+        db_role = USER_DATABASE_ROLE_MAP.get(email)
+        if db_role:
+            logger.info("[AUTH] %s → database_role=%s", email, db_role)
+            _current_database_role.set(db_role)
+
+
 # ---------------------------------------------------------------------------
 # Credentials manager (duck-types GoogleCredentialsManager)
 # ---------------------------------------------------------------------------
 class BearerTokenCredentialsManager:
-    """Returns ``google.oauth2.credentials.Credentials`` from the ContextVar.
+    """Returns ``google.oauth2.credentials.Credentials`` from the Bearer token.
 
-    If no token is present, returns ``None`` — which causes
+    Token sources (checked in order):
+    1. ContextVar ``_current_bearer_token`` — set by ASGI middleware (Cloud Run)
+    2. ``tool_context.state`` — set by ``AdkApp._init_session`` (Agent Engine)
+
+    If no token is found, returns ``None`` — which causes
     ``GoogleTool.run_async`` to return an "authorization required" message.
     """
+
+    @staticmethod
+    def _extract_token_from_state(tool_context: Any) -> Optional[str]:
+        """Extract an OAuth access token from tool_context.state.
+
+        In Agent Engine, ``AdkApp._init_session`` stores authorization
+        tokens in session state keyed by authorization resource ID.
+        We find the first string value that looks like a token.
+        """
+        if not tool_context or not hasattr(tool_context, "state"):
+            return None
+        state = tool_context.state
+        if not state:
+            return None
+        for value in state.values():
+            if isinstance(value, str) and len(value) >= _MIN_TOKEN_LENGTH:
+                return value
+        return None
 
     async def get_valid_credentials(
         self, tool_context: Any
     ) -> Optional[google.oauth2.credentials.Credentials]:
+        # 1. Cloud Run path: token from ContextVar (set by middleware)
         token = get_bearer_token()
+
+        # 2. Agent Engine path: token from session state
+        if not token:
+            token = self._extract_token_from_state(tool_context)
+
         if not token:
             logger.warning("[AUTH] No Bearer token available for Spanner call")
             return None
+
+        # Lazy FGAC resolution (Agent Engine path — middleware didn't run)
+        _resolve_and_set_database_role(token)
+
         return google.oauth2.credentials.Credentials(token=token)
 
 
