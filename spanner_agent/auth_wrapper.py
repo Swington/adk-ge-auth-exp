@@ -165,7 +165,31 @@ _Instance.database = _patched_instance_database
 # user-scoped OAuth2 credentials.  The LLM sometimes sends the project number
 # instead of the project ID string.  This callback normalizes the
 # ``project_id`` argument before the tool executes.
-_PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT", "switon-gsd-demos")
+# Map of known project numbers → project ID strings.
+# On Agent Engine, GOOGLE_CLOUD_PROJECT is often set to the project *number*
+# (e.g. "535816463745") rather than the project *ID* (e.g. "switon-gsd-demos").
+# The Spanner client fails with sessions.create PERMISSION_DENIED when given
+# a numeric project with user-scoped OAuth2 credentials.
+_PROJECT_NUMBER_TO_ID: Dict[str, str] = {
+    "535816463745": "switon-gsd-demos",
+}
+
+
+def _resolve_project_id(raw: str) -> str:
+    """Resolve a project identifier to a string project ID.
+
+    Returns the input unchanged if it's already a string project ID.
+    """
+    if raw and raw.isdigit():
+        resolved = _PROJECT_NUMBER_TO_ID.get(raw)
+        if resolved:
+            return resolved
+    return raw
+
+
+_PROJECT_ID = _resolve_project_id(
+    os.environ.get("GOOGLE_CLOUD_PROJECT", "switon-gsd-demos")
+)
 
 
 def normalize_project_id_callback(
@@ -178,13 +202,15 @@ def normalize_project_id_callback(
     """
     project_id = args.get("project_id")
     if isinstance(project_id, str) and project_id.isdigit():
-        logger.info(
-            "[AUTH] Normalizing project_id %s → %s in tool %s",
-            project_id,
-            _PROJECT_ID,
-            getattr(tool, "name", tool),
-        )
-        args["project_id"] = _PROJECT_ID
+        resolved = _resolve_project_id(project_id)
+        if resolved != project_id:
+            logger.info(
+                "[AUTH] Normalizing project_id %s → %s in tool %s",
+                project_id,
+                resolved,
+                getattr(tool, "name", tool),
+            )
+            args["project_id"] = resolved
     return None
 
 

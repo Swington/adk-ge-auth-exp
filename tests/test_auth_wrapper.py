@@ -27,6 +27,7 @@ from spanner_agent.auth_wrapper import (
     _current_database_role,
     _original_instance_database,
     _patched_instance_database,
+    _resolve_project_id,
     get_bearer_token,
     set_bearer_token,
 )
@@ -425,11 +426,8 @@ class TestNormalizeProjectIdCallback(unittest.TestCase):
     """Verify before_tool_callback normalizes project numbers in tool args."""
 
     def test_normalizes_numeric_project_id(self):
-        """Numeric project_id in tool args is replaced with configured ID."""
-        from spanner_agent.auth_wrapper import (
-            normalize_project_id_callback,
-            _PROJECT_ID,
-        )
+        """Numeric project_id in tool args is replaced with string ID."""
+        from spanner_agent.auth_wrapper import normalize_project_id_callback
 
         tool = MagicMock()
         tool.name = "spanner_list_table_names"
@@ -439,7 +437,7 @@ class TestNormalizeProjectIdCallback(unittest.TestCase):
         result = normalize_project_id_callback(tool, args, ctx)
 
         self.assertIsNone(result)  # None means continue normal execution
-        self.assertEqual(args["project_id"], _PROJECT_ID)
+        self.assertEqual(args["project_id"], "switon-gsd-demos")
 
     def test_passes_string_project_id_unchanged(self):
         """Non-numeric project_id is passed through unchanged."""
@@ -482,6 +480,22 @@ class TestNormalizeProjectIdCallback(unittest.TestCase):
 
         self.assertIsNone(result)
         self.assertEqual(args["project_id"], 12345)
+
+
+class TestResolveProjectId(unittest.TestCase):
+    """Verify _resolve_project_id handles project numbers correctly."""
+
+    def test_resolves_known_project_number(self):
+        self.assertEqual(_resolve_project_id("535816463745"), "switon-gsd-demos")
+
+    def test_returns_string_project_unchanged(self):
+        self.assertEqual(_resolve_project_id("switon-gsd-demos"), "switon-gsd-demos")
+
+    def test_returns_unknown_number_unchanged(self):
+        self.assertEqual(_resolve_project_id("999999999999"), "999999999999")
+
+    def test_returns_empty_string_unchanged(self):
+        self.assertEqual(_resolve_project_id(""), "")
 
 
 class TestMiddlewareDatabaseRole(unittest.TestCase):
