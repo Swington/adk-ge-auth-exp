@@ -1,20 +1,33 @@
-"""Per-user SA impersonation wrapper for SpannerToolset.
+"""Bearer token credential propagation for SpannerToolset.
 
-Replaces the OAuth-based GoogleCredentialsManager on each GoogleTool with
-an ImpersonatingCredentialsManager that maps tool_context.user_id to a
-service account, then creates google.auth.impersonated_credentials.Credentials.
+When Gemini Enterprise invokes the agent via A2A, it includes the end-user's
+OAuth access token in the HTTP Authorization header (Bearer <token>).  This
+module:
 
-This avoids the unusable OAuth consent flow that occurs when SpannerToolset
-is accessed through Gemini Enterprise via A2A.
+1.  Provides ASGI middleware (AuthTokenExtractorMiddleware) that extracts the
+    Bearer token and stores it in a contextvars.ContextVar so it is visible
+    anywhere in the same async call-chain.
+
+2.  Provides BearerTokenCredentialsManager — a drop-in replacement for
+    GoogleCredentialsManager — that reads the token from the ContextVar and
+    returns google.oauth2.credentials.Credentials(token=...).
+
+3.  Provides BearerTokenSpannerToolset — a BaseToolset wrapper that creates an
+    inner SpannerToolset and replaces _credentials_manager on every GoogleTool
+    with the BearerTokenCredentialsManager.
+
+Every step is logged so the pipeline can be traced end-to-end:
+    [AUTH-MIDDLEWARE] → [AUTH-CREDS] → [AUTH-TOOLSET]
 """
 
 from __future__ import annotations
 
+import contextvars
 import logging
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, List, Optional, Union
 
 import google.auth
-import google.auth.impersonated_credentials
+import google.oauth2.credentials
 from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.tools.base_tool import BaseTool
 from google.adk.tools.base_toolset import BaseToolset, ToolPredicate
@@ -24,105 +37,153 @@ from google.adk.tools.spanner.spanner_toolset import SpannerToolset
 
 logger = logging.getLogger(__name__)
 
-CLOUD_PLATFORM_SCOPE = ["https://www.googleapis.com/auth/cloud-platform"]
-
-USER_SA_MAP: Dict[str, Dict[str, Any]] = {
-    "adk-auth-exp-1@switon.altostrat.com": {
-        "sa": "user1-full-access@switon-gsd-demos.iam.gserviceaccount.com",
-        "database_role": None,
-    },
-    "adk-auth-exp-2@switon.altostrat.com": {
-        "sa": "user2-no-access@switon-gsd-demos.iam.gserviceaccount.com",
-        "database_role": None,
-    },
-    "adk-auth-exp-3@switon.altostrat.com": {
-        "sa": "user3-fgac@switon-gsd-demos.iam.gserviceaccount.com",
-        "database_role": "employees_reader",
-    },
-}
+# ---------------------------------------------------------------------------
+# ContextVar: holds the Bearer token for the current request
+# ---------------------------------------------------------------------------
+_current_bearer_token: contextvars.ContextVar[Optional[str]] = (
+    contextvars.ContextVar("bearer_token", default=None)
+)
 
 
-class ImpersonatingCredentialsManager:
-    """Duck-types GoogleCredentialsManager to return impersonated credentials.
+def get_bearer_token() -> Optional[str]:
+    """Return the Bearer token for the current async context, or None."""
+    return _current_bearer_token.get()
 
-    Maps tool_context.user_id to a service account via user_sa_map, then
-    creates google.auth.impersonated_credentials.Credentials using the
-    Cloud Run service account (ADC) as the source.
 
-    Returns None for unknown users, which causes GoogleTool.run_async to
-    return an "authorization required" message.
+def set_bearer_token(token: Optional[str]) -> contextvars.Token:
+    """Set the Bearer token for the current async context."""
+    return _current_bearer_token.set(token)
+
+
+# ---------------------------------------------------------------------------
+# ASGI Middleware
+# ---------------------------------------------------------------------------
+class AuthTokenExtractorMiddleware:
+    """ASGI middleware that pulls the Bearer token from the Authorization header.
+
+    Stores the token in ``_current_bearer_token`` so downstream code (running
+    in the same async context) can access it via ``get_bearer_token()``.
     """
 
-    def __init__(self, user_sa_map: Dict[str, Dict[str, Any]]) -> None:
-        self._user_sa_map = user_sa_map
-        self._source_credentials: Optional[google.auth.credentials.Credentials] = None
+    def __init__(self, app: Any) -> None:
+        self.app = app
 
-    def _get_source_credentials(self) -> google.auth.credentials.Credentials:
-        """Get and cache ADC source credentials."""
-        if self._source_credentials is None:
-            creds, _ = google.auth.default()
-            self._source_credentials = creds
-        return self._source_credentials
+    async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        # ASGI headers are [(name_bytes, value_bytes), …]
+        headers = dict(scope.get("headers", []))
+        auth_value = headers.get(b"authorization", b"").decode()
+
+        if auth_value.lower().startswith("bearer "):
+            token = auth_value[7:]
+            logger.info(
+                "[AUTH-MIDDLEWARE] Extracted Bearer token from Authorization "
+                "header (length=%d, first_20_chars=%s…)",
+                len(token),
+                token[:20],
+            )
+            reset = set_bearer_token(token)
+            try:
+                await self.app(scope, receive, send)
+            finally:
+                _current_bearer_token.reset(reset)
+        else:
+            if auth_value:
+                logger.info(
+                    "[AUTH-MIDDLEWARE] Authorization header present but not "
+                    "Bearer (starts with %r)",
+                    auth_value[:30],
+                )
+            else:
+                logger.info(
+                    "[AUTH-MIDDLEWARE] No Authorization header in request"
+                )
+            await self.app(scope, receive, send)
+
+
+# ---------------------------------------------------------------------------
+# Credentials manager (duck-types GoogleCredentialsManager)
+# ---------------------------------------------------------------------------
+class BearerTokenCredentialsManager:
+    """Reads the Bearer token from the ContextVar and returns Credentials.
+
+    If no token is present, returns None — which causes GoogleTool.run_async
+    to return an "authorization required" message to the LLM.
+    """
 
     async def get_valid_credentials(
         self, tool_context: Any
-    ) -> Optional[google.auth.credentials.Credentials]:
-        """Return impersonated credentials for the user, or None if unmapped."""
+    ) -> Optional[google.oauth2.credentials.Credentials]:
         user_id = getattr(tool_context, "user_id", None)
-        if not user_id:
-            logger.warning("No user_id in tool_context, returning None")
-            return None
+        logger.info(
+            "[AUTH-CREDS] get_valid_credentials called (user_id=%r)", user_id
+        )
 
-        mapping = self._user_sa_map.get(user_id)
-        if mapping is None:
+        token = get_bearer_token()
+        if not token:
             logger.warning(
-                "Unknown user_id %r not in user_sa_map, returning None", user_id
+                "[AUTH-CREDS] No Bearer token in ContextVar for user_id=%r. "
+                "Ensure AuthTokenExtractorMiddleware is active.",
+                user_id,
             )
             return None
 
-        target_sa = mapping["sa"]
-        source_creds = self._get_source_credentials()
-
-        impersonated = google.auth.impersonated_credentials.Credentials(
-            source_credentials=source_creds,
-            target_principal=target_sa,
-            target_scopes=CLOUD_PLATFORM_SCOPE,
-        )
-
         logger.info(
-            "Created impersonated credentials for user %s -> SA %s",
+            "[AUTH-CREDS] Creating google.oauth2.credentials.Credentials from "
+            "Bearer token for user_id=%r (token length=%d, "
+            "first_20_chars=%s…)",
             user_id,
-            target_sa,
+            len(token),
+            token[:20],
         )
-        return impersonated
+
+        creds = google.oauth2.credentials.Credentials(token=token)
+        logger.info(
+            "[AUTH-CREDS] Credentials created (type=%s, valid=%s, "
+            "expired=%s)",
+            type(creds).__name__,
+            creds.valid,
+            creds.expired,
+        )
+        return creds
 
 
-class ImpersonatingSpannerToolset(BaseToolset):
-    """Wraps SpannerToolset to inject per-user impersonated credentials.
+# ---------------------------------------------------------------------------
+# Toolset wrapper
+# ---------------------------------------------------------------------------
+class BearerTokenSpannerToolset(BaseToolset):
+    """Wraps SpannerToolset so every GoogleTool uses the Bearer token.
 
-    Creates an inner SpannerToolset, then replaces _credentials_manager on
-    each GoogleTool with an ImpersonatingCredentialsManager.
+    Works by replacing ``_credentials_manager`` on each GoogleTool returned
+    by the inner SpannerToolset with a ``BearerTokenCredentialsManager``.
     """
 
     def __init__(
         self,
         *,
-        user_sa_map: Dict[str, Dict[str, Any]],
         tool_filter: Optional[Union[ToolPredicate, List[str]]] = None,
         spanner_tool_settings: Optional[SpannerToolSettings] = None,
     ) -> None:
         super().__init__(tool_filter=tool_filter)
-        self._user_sa_map = user_sa_map
-        self._creds_manager = ImpersonatingCredentialsManager(user_sa_map)
+        self._creds_manager = BearerTokenCredentialsManager()
 
-        # Pass ADC credentials to satisfy SpannerCredentialsConfig validation
-        # (requires either credentials or client_id/client_secret).
-        # These will be replaced by our ImpersonatingCredentialsManager.
+        # SpannerCredentialsConfig requires *either* credentials or
+        # client_id+client_secret.  We pass ADC to satisfy validation;
+        # the credentials will never actually be used because we replace
+        # _credentials_manager on every tool.
         from google.adk.tools.spanner.spanner_credentials import (
             SpannerCredentialsConfig,
         )
 
         adc_creds, _ = google.auth.default()
+        logger.info(
+            "[AUTH-TOOLSET] Initialising inner SpannerToolset with ADC "
+            "placeholder (type=%s)",
+            type(adc_creds).__name__,
+        )
         self._inner_toolset = SpannerToolset(
             credentials_config=SpannerCredentialsConfig(credentials=adc_creds),
             spanner_tool_settings=spanner_tool_settings,
@@ -136,9 +197,20 @@ class ImpersonatingSpannerToolset(BaseToolset):
         tools = await self._inner_toolset.get_tools(readonly_context)
         for tool in tools:
             if isinstance(tool, GoogleTool):
+                logger.info(
+                    "[AUTH-TOOLSET] Replacing _credentials_manager on tool "
+                    "%r with BearerTokenCredentialsManager",
+                    tool.name,
+                )
                 tool._credentials_manager = self._creds_manager
+        logger.info(
+            "[AUTH-TOOLSET] Prepared %d tool(s): %s",
+            len(tools),
+            [t.name for t in tools],
+        )
         return tools
 
     async def close(self) -> None:
         """Delegate to inner toolset."""
+        logger.info("[AUTH-TOOLSET] Closing inner SpannerToolset")
         await self._inner_toolset.close()
