@@ -186,6 +186,85 @@ _Database.database_dialect = property(_safe_database_dialect)
 
 
 # ---------------------------------------------------------------------------
+# Monkey-patch Database.reload() and Database.exists() to skip getDdl
+# ---------------------------------------------------------------------------
+# ``Database.reload()`` and ``Database.exists()`` both call
+# ``api.get_database_ddl()`` which requires ``spanner.databases.getDdl``.
+# User-scoped OAuth credentials and FGAC roles typically lack this.
+#
+# ``reload()`` is patched to only call ``get_database`` (requires the much
+# less privileged ``spanner.databases.get``), skipping ``get_database_ddl``.
+#
+# ``exists()`` is patched to use ``get_database`` instead of
+# ``get_database_ddl`` — same semantics (returns False on NotFound).
+from google.api_core.exceptions import NotFound as _NotFound
+
+
+def _safe_reload(self):
+    """Reload database metadata without calling ``get_database_ddl()``.
+
+    The upstream ``reload()`` calls both ``get_database_ddl()`` and
+    ``get_database()``.  We skip the DDL call since it requires
+    ``spanner.databases.getDdl`` which user-scoped credentials lack.
+    """
+    from google.cloud.spanner_v1.database import _metadata_with_prefix
+    from google.cloud.spanner_admin_database_v1.types import (
+        Database as DatabasePB,
+    )
+
+    api = self._instance._client.database_admin_api
+    metadata = _metadata_with_prefix(self.name)
+    response = api.get_database(
+        name=self.name,
+        metadata=self.metadata_with_request_id(
+            self._next_nth_request, 1, metadata
+        ),
+    )
+    self._state = DatabasePB.State(response.state)
+    self._create_time = response.create_time
+    self._restore_info = response.restore_info
+    self._version_retention_period = response.version_retention_period
+    self._earliest_version_time = response.earliest_version_time
+    self._encryption_config = response.encryption_config
+    self._encryption_info = response.encryption_info
+    self._default_leader = response.default_leader
+    if response.database_dialect != DatabaseDialect.DATABASE_DIALECT_UNSPECIFIED:
+        self._database_dialect = response.database_dialect
+    self._enable_drop_protection = response.enable_drop_protection
+    self._reconciling = response.reconciling
+
+
+_original_reload = _Database.reload
+_Database.reload = _safe_reload
+
+
+def _safe_exists(self):
+    """Check database existence without calling ``get_database_ddl()``.
+
+    Uses ``get_database`` (requires ``spanner.databases.get``) instead
+    of ``get_database_ddl`` (requires ``spanner.databases.getDdl``).
+    """
+    from google.cloud.spanner_v1.database import _metadata_with_prefix
+
+    api = self._instance._client.database_admin_api
+    metadata = _metadata_with_prefix(self.name)
+    try:
+        api.get_database(
+            name=self.name,
+            metadata=self.metadata_with_request_id(
+                self._next_nth_request, 1, metadata
+            ),
+        )
+    except _NotFound:
+        return False
+    return True
+
+
+_original_exists = _Database.exists
+_Database.exists = _safe_exists
+
+
+# ---------------------------------------------------------------------------
 # Project number → project ID normalization (before_tool_callback)
 # ---------------------------------------------------------------------------
 # The Spanner Python client fails with ``spanner.sessions.create`` permission

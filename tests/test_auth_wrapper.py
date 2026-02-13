@@ -25,9 +25,13 @@ from spanner_agent.auth_wrapper import (
     USER_DATABASE_ROLE_MAP,
     _current_bearer_token,
     _current_database_role,
+    _original_exists,
     _original_instance_database,
+    _original_reload,
     _patched_instance_database,
     _resolve_project_id,
+    _safe_exists,
+    _safe_reload,
     get_bearer_token,
     set_bearer_token,
 )
@@ -533,6 +537,76 @@ class TestDatabaseDialectPropertyPatch(unittest.TestCase):
         db._database_dialect = DatabaseDialect.DATABASE_DIALECT_UNSPECIFIED
         google.cloud.spanner_v1.database.Database.database_dialect.fget(db)
         db.reload.assert_not_called()
+
+
+class TestDatabaseReloadPatch(unittest.TestCase):
+    """Verify Database.reload() is patched to skip getDdl."""
+
+    def test_reload_is_patched(self):
+        """Database.reload is our _safe_reload, not the original."""
+        db_class = google.cloud.spanner_v1.database.Database
+        self.assertIs(db_class.reload, _safe_reload)
+        self.assertIsNot(db_class.reload, _original_reload)
+
+    def test_safe_reload_does_not_call_get_database_ddl(self):
+        """_safe_reload calls get_database but NOT get_database_ddl."""
+        from google.cloud.spanner_admin_database_v1.types import (
+            Database as DatabasePB,
+        )
+
+        db = MagicMock()
+        db.name = "projects/test/instances/test/databases/test"
+        db._next_nth_request = 1
+        mock_api = MagicMock()
+        mock_response = MagicMock()
+        mock_response.state = DatabasePB.State.READY
+        mock_response.database_dialect = DatabaseDialect.GOOGLE_STANDARD_SQL
+        mock_api.get_database.return_value = mock_response
+        db._instance._client.database_admin_api = mock_api
+
+        _safe_reload(db)
+
+        mock_api.get_database.assert_called_once()
+        mock_api.get_database_ddl.assert_not_called()
+
+
+class TestDatabaseExistsPatch(unittest.TestCase):
+    """Verify Database.exists() is patched to skip getDdl."""
+
+    def test_exists_is_patched(self):
+        """Database.exists is our _safe_exists, not the original."""
+        db_class = google.cloud.spanner_v1.database.Database
+        self.assertIs(db_class.exists, _safe_exists)
+        self.assertIsNot(db_class.exists, _original_exists)
+
+    def test_safe_exists_does_not_call_get_database_ddl(self):
+        """_safe_exists calls get_database but NOT get_database_ddl."""
+        db = MagicMock()
+        db.name = "projects/test/instances/test/databases/test"
+        db._next_nth_request = 1
+        mock_api = MagicMock()
+        db._instance._client.database_admin_api = mock_api
+
+        result = _safe_exists(db)
+
+        self.assertTrue(result)
+        mock_api.get_database.assert_called_once()
+        mock_api.get_database_ddl.assert_not_called()
+
+    def test_safe_exists_returns_false_on_not_found(self):
+        """_safe_exists returns False when database doesn't exist."""
+        from google.api_core.exceptions import NotFound
+
+        db = MagicMock()
+        db.name = "projects/test/instances/test/databases/nonexistent"
+        db._next_nth_request = 1
+        mock_api = MagicMock()
+        mock_api.get_database.side_effect = NotFound("not found")
+        db._instance._client.database_admin_api = mock_api
+
+        result = _safe_exists(db)
+
+        self.assertFalse(result)
 
 
 class TestMiddlewareDatabaseRole(unittest.TestCase):
