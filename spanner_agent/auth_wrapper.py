@@ -23,6 +23,10 @@ This module:
     inner SpannerToolset and replaces _credentials_manager on every GoogleTool
     with the BearerTokenCredentialsManager.
 
+4.  Monkey-patches ``google.cloud.spanner.Instance.database`` so that
+    FGAC database roles are automatically applied based on the user's email
+    (resolved from the OAuth token via Google tokeninfo).
+
 Every step is logged so the pipeline can be traced end-to-end:
     [AUTH-MIDDLEWARE] → [AUTH-CREDS] → [AUTH-TOOLSET]
 """
@@ -31,10 +35,12 @@ from __future__ import annotations
 
 import contextvars
 import logging
-from typing import Any, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import google.auth
+import google.cloud.spanner_v1.instance
 import google.oauth2.credentials
+import httpx
 from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.tools.base_tool import BaseTool
 from google.adk.tools.base_toolset import BaseToolset, ToolPredicate
@@ -45,11 +51,67 @@ from google.adk.tools.spanner.spanner_toolset import SpannerToolset
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# ContextVar: holds the Bearer token for the current request
+# User → Spanner database role mapping (for FGAC)
+# ---------------------------------------------------------------------------
+# Maps user email to the Spanner database role they should assume.
+# Users not in this map connect without a database role (standard IAM access).
+USER_DATABASE_ROLE_MAP: Dict[str, str] = {
+    "adk-auth-exp-3@switon.altostrat.com": "employees_reader",
+}
+
+# ---------------------------------------------------------------------------
+# ContextVars: hold per-request state
 # ---------------------------------------------------------------------------
 _current_bearer_token: contextvars.ContextVar[Optional[str]] = (
     contextvars.ContextVar("bearer_token", default=None)
 )
+_current_database_role: contextvars.ContextVar[Optional[str]] = (
+    contextvars.ContextVar("database_role", default=None)
+)
+
+
+def _resolve_user_email(token: str) -> Optional[str]:
+    """Resolve the user's email from an OAuth access token via tokeninfo."""
+    try:
+        resp = httpx.get(
+            "https://www.googleapis.com/oauth2/v3/tokeninfo",
+            params={"access_token": token},
+            timeout=5.0,
+        )
+        if resp.status_code == 200:
+            email = resp.json().get("email")
+            logger.info("[AUTH-MIDDLEWARE] Resolved token to email=%s", email)
+            return email
+        logger.warning(
+            "[AUTH-MIDDLEWARE] tokeninfo returned status=%d", resp.status_code
+        )
+    except Exception as exc:
+        logger.warning("[AUTH-MIDDLEWARE] tokeninfo call failed: %s", exc)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Monkey-patch Instance.database() to inject database_role from ContextVar
+# ---------------------------------------------------------------------------
+_Instance = google.cloud.spanner_v1.instance.Instance
+_original_instance_database = _Instance.database
+
+
+def _patched_instance_database(self, database_id, *args, **kwargs):
+    """Wrapper that injects database_role from the ContextVar if set."""
+    db_role = _current_database_role.get()
+    if db_role and "database_role" not in kwargs:
+        logger.info(
+            "[AUTH-FGAC] Injecting database_role=%r for database=%s",
+            db_role,
+            database_id,
+        )
+        kwargs["database_role"] = db_role
+    return _original_instance_database(self, database_id, *args, **kwargs)
+
+
+_Instance.database = _patched_instance_database
+logger.info("[AUTH-FGAC] Monkey-patched Instance.database() for FGAC support")
 
 
 def get_bearer_token() -> Optional[str]:
@@ -125,11 +187,26 @@ class AuthTokenExtractorMiddleware:
                 len(token),
                 token[:20],
             )
-            reset = set_bearer_token(token)
+            reset_token = set_bearer_token(token)
+
+            # Resolve user email and set database_role for FGAC
+            db_role = None
+            email = _resolve_user_email(token)
+            if email:
+                db_role = USER_DATABASE_ROLE_MAP.get(email)
+                if db_role:
+                    logger.info(
+                        "[AUTH-MIDDLEWARE] User %s → database_role=%s",
+                        email,
+                        db_role,
+                    )
+            reset_role = _current_database_role.set(db_role)
+
             try:
                 await self.app(scope, receive, send)
             finally:
-                _current_bearer_token.reset(reset)
+                _current_bearer_token.reset(reset_token)
+                _current_database_role.reset(reset_role)
         else:
             auth_value = headers.get(b"authorization", b"").decode()
             if auth_value:
