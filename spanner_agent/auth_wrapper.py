@@ -73,14 +73,40 @@ _current_database_role: contextvars.ContextVar[Optional[str]] = (
 )
 
 
+def _revoke_token(token: str) -> None:
+    """Revoke an OAuth token to force re-authorization.
+
+    Revoking an access token also revokes the associated refresh token,
+    which forces the client (Gemini Enterprise) to re-run the OAuth
+    consent flow — this time with the updated scopes (including email).
+    """
+    try:
+        resp = httpx.post(
+            "https://oauth2.googleapis.com/revoke",
+            params={"token": token},
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=5.0,
+        )
+        logger.info(
+            "[AUTH-MIDDLEWARE] Token revocation response: status=%d",
+            resp.status_code,
+        )
+    except Exception as exc:
+        logger.warning("[AUTH-MIDDLEWARE] Token revocation failed: %s", exc)
+
+
 def _resolve_user_email(token: str) -> Optional[str]:
     """Resolve the user's email from an OAuth access token.
 
     Tries two endpoints:
     1. tokeninfo (works when token has email scope)
     2. userinfo (works when token has email or openid scope)
+
+    If the token lacks the email scope entirely, it is revoked so the
+    client is forced to re-authorize with the updated scopes.
     """
     # Try tokeninfo first
+    token_scope = None
     try:
         resp = httpx.get(
             "https://www.googleapis.com/oauth2/v3/tokeninfo",
@@ -89,8 +115,11 @@ def _resolve_user_email(token: str) -> Optional[str]:
         )
         if resp.status_code == 200:
             data = resp.json()
+            token_scope = data.get("scope", "")
             logger.info(
-                "[AUTH-MIDDLEWARE] tokeninfo response keys=%s", list(data.keys())
+                "[AUTH-MIDDLEWARE] tokeninfo response keys=%s scope=%r",
+                list(data.keys()),
+                token_scope,
             )
             email = data.get("email")
             if email:
@@ -135,6 +164,17 @@ def _resolve_user_email(token: str) -> Optional[str]:
             )
     except Exception as exc:
         logger.warning("[AUTH-MIDDLEWARE] userinfo call failed: %s", exc)
+
+    # If we got tokeninfo but the scope is missing email, revoke the token
+    # so the client (Gemini Enterprise) is forced to re-authorize with the
+    # updated authorization resource that now includes the email scope.
+    if token_scope is not None and "email" not in token_scope:
+        logger.warning(
+            "[AUTH-MIDDLEWARE] Token lacks email scope (scope=%r). "
+            "Revoking to force re-authorization with updated scopes.",
+            token_scope,
+        )
+        _revoke_token(token)
 
     logger.warning("[AUTH-MIDDLEWARE] Could not resolve email from token")
     return None
