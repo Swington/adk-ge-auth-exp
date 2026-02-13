@@ -36,6 +36,8 @@ import contextvars
 import logging
 from typing import Any, Dict, List, Optional, Union
 
+import os
+
 import google.auth
 import google.cloud.spanner_v1.instance
 import google.oauth2.credentials
@@ -129,8 +131,8 @@ def _patched_instance_database(self, database_id, *args, **kwargs):
 
     Injects the FGAC ``database_role`` from the ContextVar when set.
 
-    Pre-sets ``_database_dialect`` to ``GOOGLE_STANDARD_SQL`` on the
-    returned ``Database`` object.  Without this, the first access to
+    Pre-sets ``database_dialect`` to ``GOOGLE_STANDARD_SQL`` via the
+    constructor parameter.  Without this, the first access to
     ``Database.database_dialect`` triggers ``reload()`` → ``getDdl``,
     which requires ``spanner.databases.getDdl`` — a permission that
     FGAC database roles typically lack.
@@ -143,21 +145,47 @@ def _patched_instance_database(self, database_id, *args, **kwargs):
             database_id,
         )
         kwargs["database_role"] = db_role
-    db = _original_instance_database(self, database_id, *args, **kwargs)
-    # Pre-set dialect to avoid reload() → getDdl admin API call.
-    if (
-        hasattr(db, "_database_dialect")
-        and db._database_dialect == DatabaseDialect.DATABASE_DIALECT_UNSPECIFIED
-    ):
-        db._database_dialect = DatabaseDialect.GOOGLE_STANDARD_SQL
+    if "database_dialect" not in kwargs:
+        kwargs["database_dialect"] = DatabaseDialect.GOOGLE_STANDARD_SQL
         logger.info(
             "[AUTH] Pre-set database_dialect=GOOGLE_STANDARD_SQL for %s",
             database_id,
         )
-    return db
+    return _original_instance_database(self, database_id, *args, **kwargs)
 
 
 _Instance.database = _patched_instance_database
+
+
+# ---------------------------------------------------------------------------
+# Project number → project ID normalization (before_tool_callback)
+# ---------------------------------------------------------------------------
+# The Spanner Python client fails with ``spanner.sessions.create`` permission
+# denied when called with a project NUMBER (e.g. ``535816463745``) and
+# user-scoped OAuth2 credentials.  The LLM sometimes sends the project number
+# instead of the project ID string.  This callback normalizes the
+# ``project_id`` argument before the tool executes.
+_PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT", "switon-gsd-demos")
+
+
+def normalize_project_id_callback(
+    tool: Any, args: dict, tool_context: Any
+) -> Optional[dict]:
+    """Normalize numeric project IDs in Spanner tool arguments.
+
+    Used as ``before_tool_callback`` on the Agent.  Modifies ``args`` in
+    place and returns ``None`` so the tool executes normally.
+    """
+    project_id = args.get("project_id")
+    if isinstance(project_id, str) and project_id.isdigit():
+        logger.info(
+            "[AUTH] Normalizing project_id %s → %s in tool %s",
+            project_id,
+            _PROJECT_ID,
+            getattr(tool, "name", tool),
+        )
+        args["project_id"] = _PROJECT_ID
+    return None
 
 
 def get_bearer_token() -> Optional[str]:

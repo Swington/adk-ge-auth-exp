@@ -357,64 +357,131 @@ class TestDatabaseDialectPreset(unittest.TestCase):
     The Spanner client's Database.database_dialect property triggers
     reload() → getDdl when dialect is UNSPECIFIED. FGAC database roles
     don't have getDdl permission, so we pre-set the dialect to
-    GOOGLE_STANDARD_SQL to avoid the admin API call.
+    GOOGLE_STANDARD_SQL via the constructor kwarg.
     """
 
     def tearDown(self):
         _current_database_role.set(None)
 
-    def test_presets_dialect_to_google_standard_sql(self):
-        """Returned database has _database_dialect set to GOOGLE_STANDARD_SQL."""
+    def test_passes_dialect_kwarg(self):
+        """Passes database_dialect=GOOGLE_STANDARD_SQL to original method."""
         mock_db = MagicMock()
-        mock_db._database_dialect = DatabaseDialect.DATABASE_DIALECT_UNSPECIFIED
-        mock_instance = MagicMock()
-        _original_instance_database.return_value = mock_db
-
-        with patch(
-            "spanner_agent.auth_wrapper._original_instance_database",
-            return_value=mock_db,
-        ):
-            result = _patched_instance_database(mock_instance, "test-db")
-
-        self.assertEqual(
-            result._database_dialect, DatabaseDialect.GOOGLE_STANDARD_SQL
-        )
-
-    def test_preserves_explicit_dialect(self):
-        """If dialect is already set (not UNSPECIFIED), don't override it."""
-        mock_db = MagicMock()
-        mock_db._database_dialect = DatabaseDialect.POSTGRESQL
-        mock_instance = MagicMock()
-
-        with patch(
-            "spanner_agent.auth_wrapper._original_instance_database",
-            return_value=mock_db,
-        ):
-            result = _patched_instance_database(mock_instance, "test-db")
-
-        self.assertEqual(result._database_dialect, DatabaseDialect.POSTGRESQL)
-
-    def test_dialect_preset_works_with_role_injection(self):
-        """Both dialect preset and role injection work together."""
-        _current_database_role.set("employees_reader")
-        mock_db = MagicMock()
-        mock_db._database_dialect = DatabaseDialect.DATABASE_DIALECT_UNSPECIFIED
         mock_instance = MagicMock()
 
         with patch(
             "spanner_agent.auth_wrapper._original_instance_database",
             return_value=mock_db,
         ) as mock_orig:
-            result = _patched_instance_database(mock_instance, "test-db")
+            _patched_instance_database(mock_instance, "test-db")
 
-        # Role injected
         mock_orig.assert_called_once_with(
-            mock_instance, "test-db", database_role="employees_reader"
+            mock_instance,
+            "test-db",
+            database_dialect=DatabaseDialect.GOOGLE_STANDARD_SQL,
         )
-        # Dialect preset
-        self.assertEqual(
-            result._database_dialect, DatabaseDialect.GOOGLE_STANDARD_SQL
+
+    def test_preserves_explicit_dialect(self):
+        """If dialect is explicitly passed, don't override it."""
+        mock_db = MagicMock()
+        mock_instance = MagicMock()
+
+        with patch(
+            "spanner_agent.auth_wrapper._original_instance_database",
+            return_value=mock_db,
+        ) as mock_orig:
+            _patched_instance_database(
+                mock_instance,
+                "test-db",
+                database_dialect=DatabaseDialect.POSTGRESQL,
+            )
+
+        mock_orig.assert_called_once_with(
+            mock_instance,
+            "test-db",
+            database_dialect=DatabaseDialect.POSTGRESQL,
         )
+
+    def test_dialect_preset_works_with_role_injection(self):
+        """Both dialect preset and role injection work together."""
+        _current_database_role.set("employees_reader")
+        mock_db = MagicMock()
+        mock_instance = MagicMock()
+
+        with patch(
+            "spanner_agent.auth_wrapper._original_instance_database",
+            return_value=mock_db,
+        ) as mock_orig:
+            _patched_instance_database(mock_instance, "test-db")
+
+        mock_orig.assert_called_once_with(
+            mock_instance,
+            "test-db",
+            database_role="employees_reader",
+            database_dialect=DatabaseDialect.GOOGLE_STANDARD_SQL,
+        )
+
+
+class TestNormalizeProjectIdCallback(unittest.TestCase):
+    """Verify before_tool_callback normalizes project numbers in tool args."""
+
+    def test_normalizes_numeric_project_id(self):
+        """Numeric project_id in tool args is replaced with configured ID."""
+        from spanner_agent.auth_wrapper import (
+            normalize_project_id_callback,
+            _PROJECT_ID,
+        )
+
+        tool = MagicMock()
+        tool.name = "spanner_list_table_names"
+        args = {"project_id": "535816463745", "instance_id": "adk-auth-exp"}
+        ctx = _make_tool_context("user@example.com")
+
+        result = normalize_project_id_callback(tool, args, ctx)
+
+        self.assertIsNone(result)  # None means continue normal execution
+        self.assertEqual(args["project_id"], _PROJECT_ID)
+
+    def test_passes_string_project_id_unchanged(self):
+        """Non-numeric project_id is passed through unchanged."""
+        from spanner_agent.auth_wrapper import normalize_project_id_callback
+
+        tool = MagicMock()
+        tool.name = "spanner_execute_sql"
+        args = {"project_id": "switon-gsd-demos", "instance_id": "adk-auth-exp"}
+        ctx = _make_tool_context("user@example.com")
+
+        result = normalize_project_id_callback(tool, args, ctx)
+
+        self.assertIsNone(result)
+        self.assertEqual(args["project_id"], "switon-gsd-demos")
+
+    def test_no_project_id_in_args(self):
+        """When project_id is not in args, callback does nothing."""
+        from spanner_agent.auth_wrapper import normalize_project_id_callback
+
+        tool = MagicMock()
+        tool.name = "some_tool"
+        args = {"query": "SELECT 1"}
+        ctx = _make_tool_context("user@example.com")
+
+        result = normalize_project_id_callback(tool, args, ctx)
+
+        self.assertIsNone(result)
+        self.assertNotIn("project_id", args)
+
+    def test_non_string_project_id_unchanged(self):
+        """Non-string project_id values are left unchanged."""
+        from spanner_agent.auth_wrapper import normalize_project_id_callback
+
+        tool = MagicMock()
+        tool.name = "some_tool"
+        args = {"project_id": 12345}
+        ctx = _make_tool_context("user@example.com")
+
+        result = normalize_project_id_callback(tool, args, ctx)
+
+        self.assertIsNone(result)
+        self.assertEqual(args["project_id"], 12345)
 
 
 class TestMiddlewareDatabaseRole(unittest.TestCase):

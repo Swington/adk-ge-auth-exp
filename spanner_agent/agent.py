@@ -6,7 +6,7 @@ import os
 from google.adk.agents import Agent
 from google.adk.tools.spanner.settings import Capabilities, SpannerToolSettings
 
-from .auth_wrapper import BearerTokenSpannerToolset
+from .auth_wrapper import BearerTokenSpannerToolset, normalize_project_id_callback
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -37,8 +37,10 @@ You can help users by:
 When a user asks about data, first list the available tables, then examine
 their schemas, and then construct appropriate SQL queries.
 
-Always use the project_id="{PROJECT_ID}", instance_id="{SPANNER_INSTANCE_ID}",
-and database_id="{SPANNER_DATABASE_ID}" when calling Spanner tools.
+CRITICAL: Always use these EXACT string values when calling Spanner tools:
+- project_id="{PROJECT_ID}" (NEVER use the numeric project number)
+- instance_id="{SPANNER_INSTANCE_ID}"
+- database_id="{SPANNER_DATABASE_ID}"
 
 If you encounter permission errors, explain to the user that they may not
 have access to the requested resource due to IAM or fine-grained access
@@ -51,4 +53,5 @@ root_agent = Agent(
     description="An agent that queries Spanner databases with user credential propagation.",
     instruction=AGENT_INSTRUCTION,
     tools=[spanner_toolset],
+    before_tool_callback=normalize_project_id_callback,
 )
