@@ -265,6 +265,43 @@ _Database.exists = _safe_exists
 
 
 # ---------------------------------------------------------------------------
+# Nuclear option: patch DatabaseAdminClient.get_database_ddl at the API level
+# ---------------------------------------------------------------------------
+# As a final defense-in-depth measure, patch the ``get_database_ddl`` method
+# on ``DatabaseAdminClient`` itself.  If *any* code path — including ones in
+# newer Spanner library versions that we haven't seen — attempts to call this
+# API, it will receive an empty DDL response instead of hitting the Spanner
+# admin API (which requires ``spanner.databases.getDdl``).
+#
+# This is intentionally the *last* patch so that the higher-level patches
+# (property, reload, exists) prevent most callers from ever reaching here,
+# and this layer catches anything that slips through.
+from google.cloud.spanner_admin_database_v1.services.database_admin import (
+    DatabaseAdminClient as _DatabaseAdminClient,
+)
+from google.cloud.spanner_admin_database_v1.types import (
+    GetDatabaseDdlResponse as _GetDatabaseDdlResponse,
+)
+
+_original_get_database_ddl = _DatabaseAdminClient.get_database_ddl
+
+
+def _blocked_get_database_ddl(self, *args, **kwargs):
+    """Return an empty DDL response instead of calling the API.
+
+    This prevents ``spanner.databases.getDdl`` permission errors for
+    user-scoped OAuth credentials and FGAC database roles.
+    """
+    logger.info(
+        "[AUTH] Blocked get_database_ddl call (would require getDdl permission)"
+    )
+    return _GetDatabaseDdlResponse(statements=[])
+
+
+_DatabaseAdminClient.get_database_ddl = _blocked_get_database_ddl
+
+
+# ---------------------------------------------------------------------------
 # Project number → project ID normalization (before_tool_callback)
 # ---------------------------------------------------------------------------
 # The Spanner Python client fails with ``spanner.sessions.create`` permission

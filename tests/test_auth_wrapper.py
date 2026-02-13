@@ -23,9 +23,11 @@ from spanner_agent.auth_wrapper import (
     BearerTokenCredentialsManager,
     BearerTokenSpannerToolset,
     USER_DATABASE_ROLE_MAP,
+    _blocked_get_database_ddl,
     _current_bearer_token,
     _current_database_role,
     _original_exists,
+    _original_get_database_ddl,
     _original_instance_database,
     _original_reload,
     _patched_instance_database,
@@ -607,6 +609,46 @@ class TestDatabaseExistsPatch(unittest.TestCase):
         result = _safe_exists(db)
 
         self.assertFalse(result)
+
+
+class TestGetDatabaseDdlBlocked(unittest.TestCase):
+    """Verify DatabaseAdminClient.get_database_ddl is blocked at the API level.
+
+    This is the nuclear defense-in-depth patch: even if all higher-level patches
+    (property, reload, exists) are somehow bypassed, the API call itself returns
+    an empty DDL response instead of hitting Spanner admin API.
+    """
+
+    def test_admin_client_method_is_patched(self):
+        """DatabaseAdminClient.get_database_ddl is our blocked version."""
+        from google.cloud.spanner_admin_database_v1.services.database_admin import (
+            DatabaseAdminClient,
+        )
+
+        self.assertIs(
+            DatabaseAdminClient.get_database_ddl, _blocked_get_database_ddl
+        )
+        self.assertIsNot(
+            DatabaseAdminClient.get_database_ddl, _original_get_database_ddl
+        )
+
+    def test_blocked_returns_empty_ddl_response(self):
+        """The blocked method returns GetDatabaseDdlResponse with empty statements."""
+        from google.cloud.spanner_admin_database_v1.types import (
+            GetDatabaseDdlResponse,
+        )
+
+        mock_client = MagicMock()
+        result = _blocked_get_database_ddl(mock_client, database="test-db")
+        self.assertIsInstance(result, GetDatabaseDdlResponse)
+        self.assertEqual(list(result.statements), [])
+
+    def test_blocked_never_calls_real_api(self):
+        """The blocked method does not make any API calls."""
+        mock_client = MagicMock()
+        _blocked_get_database_ddl(mock_client, database="test-db")
+        # No transport calls should be made
+        mock_client._transport.assert_not_called()
 
 
 class TestMiddlewareDatabaseRole(unittest.TestCase):
