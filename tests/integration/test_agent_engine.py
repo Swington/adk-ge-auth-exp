@@ -21,7 +21,7 @@ from vertexai.agent_engines import AdkApp
 
 PROJECT_ID = "switon-gsd-demos"
 REGION = "us-central1"
-AGENT_ENGINE_ID = "5919158175969312768"
+AGENT_ENGINE_ID = "954924749211828224"
 
 # Service accounts used for impersonation to simulate workspace users
 USER1_SA = "user1-full-access@switon-gsd-demos.iam.gserviceaccount.com"
