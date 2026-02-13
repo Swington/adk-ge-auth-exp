@@ -252,13 +252,23 @@ class BearerTokenCredentialsManager:
         In Agent Engine, ``AdkApp._init_session`` stores authorization
         tokens in session state keyed by authorization resource ID.
         We find the first string value that looks like a token.
+
+        The ADK ``State`` class doesn't support ``.values()`` — we use
+        ``.to_dict()`` (if available) or fall back to treating it as a
+        plain dict.
         """
         if not tool_context or not hasattr(tool_context, "state"):
             return None
         state = tool_context.state
         if not state:
             return None
-        for value in state.values():
+        # State is an ADK State object (to_dict) or a plain dict (values)
+        items = (
+            state.to_dict().values()
+            if hasattr(state, "to_dict")
+            else state.values()
+        )
+        for value in items:
             if isinstance(value, str) and len(value) >= _MIN_TOKEN_LENGTH:
                 return value
         return None

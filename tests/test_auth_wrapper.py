@@ -460,6 +460,19 @@ class TestCredentialsManagerFromState(unittest.TestCase):
         creds = _run(self.manager.get_valid_credentials(ctx))
         self.assertIsNone(creds)
 
+    def test_reads_token_from_adk_state_object(self):
+        """Works with ADK State objects that have to_dict() instead of values()."""
+        ctx = _make_tool_context("user@example.com")
+        # Simulate ADK State object (has to_dict but no values)
+        mock_state = MagicMock()
+        mock_state.__bool__ = MagicMock(return_value=True)
+        mock_state.to_dict.return_value = {"auth_id_123": FAKE_TOKEN}
+        del mock_state.values  # State doesn't have .values()
+        ctx.state = mock_state
+        creds = _run(self.manager.get_valid_credentials(ctx))
+        self.assertIsNotNone(creds)
+        self.assertEqual(creds.token, FAKE_TOKEN)
+
     @patch("spanner_agent.auth_wrapper._resolve_user_email")
     def test_sets_fgac_role_from_state_token(self, mock_resolve):
         """Agent Engine path: resolves email and sets database_role.
