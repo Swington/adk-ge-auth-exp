@@ -53,10 +53,13 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # User → Spanner database role mapping (for FGAC)
 # ---------------------------------------------------------------------------
-# Maps user email to the Spanner database role they should assume.
+# Maps user email (or SA email) to the Spanner database role they should assume.
 # Users not in this map connect without a database role (standard IAM access).
 USER_DATABASE_ROLE_MAP: Dict[str, str] = {
+    # Workspace user (Gemini Enterprise OAuth flow)
     "adk-auth-exp-3@switon.altostrat.com": "employees_reader",
+    # Service account (integration tests / SA impersonation)
+    "user3-fgac@switon-gsd-demos.iam.gserviceaccount.com": "employees_reader",
 }
 
 # ---------------------------------------------------------------------------
@@ -71,7 +74,13 @@ _current_database_role: contextvars.ContextVar[Optional[str]] = (
 
 
 def _resolve_user_email(token: str) -> Optional[str]:
-    """Resolve the user's email from an OAuth access token via tokeninfo."""
+    """Resolve the user's email from an OAuth access token.
+
+    Tries two endpoints:
+    1. tokeninfo (works when token has email scope)
+    2. userinfo (works when token has email or openid scope)
+    """
+    # Try tokeninfo first
     try:
         resp = httpx.get(
             "https://www.googleapis.com/oauth2/v3/tokeninfo",
@@ -79,14 +88,55 @@ def _resolve_user_email(token: str) -> Optional[str]:
             timeout=5.0,
         )
         if resp.status_code == 200:
-            email = resp.json().get("email")
-            logger.info("[AUTH-MIDDLEWARE] Resolved token to email=%s", email)
-            return email
-        logger.warning(
-            "[AUTH-MIDDLEWARE] tokeninfo returned status=%d", resp.status_code
-        )
+            data = resp.json()
+            logger.info(
+                "[AUTH-MIDDLEWARE] tokeninfo response keys=%s", list(data.keys())
+            )
+            email = data.get("email")
+            if email:
+                logger.info(
+                    "[AUTH-MIDDLEWARE] Resolved token to email=%s via tokeninfo",
+                    email,
+                )
+                return email
+            logger.info(
+                "[AUTH-MIDDLEWARE] tokeninfo has no email field, trying userinfo"
+            )
+        else:
+            logger.warning(
+                "[AUTH-MIDDLEWARE] tokeninfo returned status=%d", resp.status_code
+            )
     except Exception as exc:
         logger.warning("[AUTH-MIDDLEWARE] tokeninfo call failed: %s", exc)
+
+    # Fallback to userinfo endpoint
+    try:
+        resp = httpx.get(
+            "https://www.googleapis.com/oauth2/v3/userinfo",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=5.0,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            logger.info(
+                "[AUTH-MIDDLEWARE] userinfo response keys=%s", list(data.keys())
+            )
+            email = data.get("email")
+            if email:
+                logger.info(
+                    "[AUTH-MIDDLEWARE] Resolved token to email=%s via userinfo",
+                    email,
+                )
+                return email
+            logger.info("[AUTH-MIDDLEWARE] userinfo has no email field either")
+        else:
+            logger.warning(
+                "[AUTH-MIDDLEWARE] userinfo returned status=%d", resp.status_code
+            )
+    except Exception as exc:
+        logger.warning("[AUTH-MIDDLEWARE] userinfo call failed: %s", exc)
+
+    logger.warning("[AUTH-MIDDLEWARE] Could not resolve email from token")
     return None
 
 
@@ -100,6 +150,13 @@ _original_instance_database = _Instance.database
 def _patched_instance_database(self, database_id, *args, **kwargs):
     """Wrapper that injects database_role from the ContextVar if set."""
     db_role = _current_database_role.get()
+    logger.info(
+        "[AUTH-FGAC] Instance.database() called: database=%s, "
+        "contextvar_role=%r, existing_role=%r",
+        database_id,
+        db_role,
+        kwargs.get("database_role"),
+    )
     if db_role and "database_role" not in kwargs:
         logger.info(
             "[AUTH-FGAC] Injecting database_role=%r for database=%s",

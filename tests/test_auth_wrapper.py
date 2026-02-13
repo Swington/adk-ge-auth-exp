@@ -402,6 +402,14 @@ class TestDatabaseRoleContextVar(unittest.TestCase):
             "employees_reader",
         )
 
+    def test_user_database_role_map_contains_user3_sa(self):
+        self.assertEqual(
+            USER_DATABASE_ROLE_MAP.get(
+                "user3-fgac@switon-gsd-demos.iam.gserviceaccount.com"
+            ),
+            "employees_reader",
+        )
+
     def test_user_database_role_map_returns_none_for_unknown(self):
         self.assertIsNone(
             USER_DATABASE_ROLE_MAP.get("unknown@example.com"),

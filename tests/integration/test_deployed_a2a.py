@@ -53,7 +53,7 @@ def _get_impersonated_access_token(target_sa: str) -> str:
     impersonated = google.auth.impersonated_credentials.Credentials(
         source_credentials=source_creds,
         target_principal=target_sa,
-        target_scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        target_scopes=["https://www.googleapis.com/auth/cloud-platform", "email"],
     )
     auth_req = google.auth.transport.requests.Request()
     impersonated.refresh(auth_req)
@@ -242,6 +242,25 @@ class TestFgacUser:
         text = _extract_agent_text(result)
         logger.info("FGAC user employees response: %s", text[:1000])
         assert "result" in result
+
+    def test_query_salaries_denied(self, identity_token, fgac_token):
+        """FGAC user should NOT be able to read salaries table."""
+        with httpx.Client() as client:
+            result = _a2a_message_send(
+                client,
+                text="Run this SQL: SELECT * FROM salaries LIMIT 3",
+                identity_token=identity_token,
+                user_access_token=fgac_token,
+            )
+
+        text = _extract_agent_text(result)
+        logger.info("FGAC user salaries response: %s", text[:1000])
+        assert "result" in result
+        text_lower = text.lower()
+        assert any(
+            keyword in text_lower
+            for keyword in ["permission", "denied", "access", "error", "not found"]
+        ), f"Expected permission error for salaries, got: {text[:500]}"
 
 
 class TestNoTokenRequest:
