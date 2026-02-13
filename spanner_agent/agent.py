@@ -6,7 +6,7 @@ import os
 from google.adk.agents import Agent
 from google.adk.tools.spanner.settings import Capabilities, SpannerToolSettings
 
-from spanner_agent.auth_wrapper import BearerTokenSpannerToolset
+from .auth_wrapper import BearerTokenSpannerToolset
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
