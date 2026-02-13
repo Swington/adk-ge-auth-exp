@@ -95,15 +95,18 @@ def _revoke_token(token: str) -> None:
         logger.warning("[AUTH-MIDDLEWARE] Token revocation failed: %s", exc)
 
 
-def _resolve_user_email(token: str) -> Optional[str]:
+def _resolve_user_email(token: str) -> tuple[Optional[str], bool]:
     """Resolve the user's email from an OAuth access token.
 
     Tries two endpoints:
     1. tokeninfo (works when token has email scope)
     2. userinfo (works when token has email or openid scope)
 
-    If the token lacks the email scope entirely, it is revoked so the
-    client is forced to re-authorize with the updated scopes.
+    Returns:
+        (email, needs_revocation) — email is the resolved email or None;
+        needs_revocation is True if the token lacks the email scope and
+        should be revoked AFTER the request completes to force
+        re-authorization with updated scopes.
     """
     # Try tokeninfo first
     token_scope = None
@@ -127,7 +130,7 @@ def _resolve_user_email(token: str) -> Optional[str]:
                     "[AUTH-MIDDLEWARE] Resolved token to email=%s via tokeninfo",
                     email,
                 )
-                return email
+                return email, False
             logger.info(
                 "[AUTH-MIDDLEWARE] tokeninfo has no email field, trying userinfo"
             )
@@ -156,7 +159,7 @@ def _resolve_user_email(token: str) -> Optional[str]:
                     "[AUTH-MIDDLEWARE] Resolved token to email=%s via userinfo",
                     email,
                 )
-                return email
+                return email, False
             logger.info("[AUTH-MIDDLEWARE] userinfo has no email field either")
         else:
             logger.warning(
@@ -165,19 +168,20 @@ def _resolve_user_email(token: str) -> Optional[str]:
     except Exception as exc:
         logger.warning("[AUTH-MIDDLEWARE] userinfo call failed: %s", exc)
 
-    # If we got tokeninfo but the scope is missing email, revoke the token
-    # so the client (Gemini Enterprise) is forced to re-authorize with the
-    # updated authorization resource that now includes the email scope.
-    if token_scope is not None and "email" not in token_scope:
+    # Flag for revocation if the token lacks the email scope — the caller
+    # must revoke AFTER the request completes (not before, because the
+    # token is still needed for Spanner API calls in this request).
+    needs_revocation = token_scope is not None and "email" not in token_scope
+    if needs_revocation:
         logger.warning(
             "[AUTH-MIDDLEWARE] Token lacks email scope (scope=%r). "
-            "Revoking to force re-authorization with updated scopes.",
+            "Will revoke AFTER request to force re-authorization.",
             token_scope,
         )
-        _revoke_token(token)
+    else:
+        logger.warning("[AUTH-MIDDLEWARE] Could not resolve email from token")
 
-    logger.warning("[AUTH-MIDDLEWARE] Could not resolve email from token")
-    return None
+    return None, needs_revocation
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +292,7 @@ class AuthTokenExtractorMiddleware:
 
             # Resolve user email and set database_role for FGAC
             db_role = None
-            email = _resolve_user_email(token)
+            email, needs_revocation = _resolve_user_email(token)
             if email:
                 db_role = USER_DATABASE_ROLE_MAP.get(email)
                 if db_role:
@@ -304,6 +308,12 @@ class AuthTokenExtractorMiddleware:
             finally:
                 _current_bearer_token.reset(reset_token)
                 _current_database_role.reset(reset_role)
+                # Revoke stale tokens AFTER the request so Spanner calls
+                # still work in this request.  Revoking also invalidates
+                # the refresh token, forcing Gemini Enterprise to
+                # re-authorize with the updated scopes on the next request.
+                if needs_revocation:
+                    _revoke_token(token)
         else:
             auth_value = headers.get(b"authorization", b"").decode()
             if auth_value:

@@ -452,7 +452,7 @@ class TestMiddlewareDatabaseRole(unittest.TestCase):
     @patch("spanner_agent.auth_wrapper._resolve_user_email")
     def test_middleware_sets_database_role_for_fgac_user(self, mock_resolve):
         """Middleware should set database_role for FGAC users."""
-        mock_resolve.return_value = "adk-auth-exp-3@switon.altostrat.com"
+        mock_resolve.return_value = ("adk-auth-exp-3@switon.altostrat.com", False)
 
         captured_role = None
 
@@ -476,7 +476,7 @@ class TestMiddlewareDatabaseRole(unittest.TestCase):
     @patch("spanner_agent.auth_wrapper._resolve_user_email")
     def test_middleware_no_role_for_regular_user(self, mock_resolve):
         """Middleware should NOT set database_role for non-FGAC users."""
-        mock_resolve.return_value = "adk-auth-exp-1@switon.altostrat.com"
+        mock_resolve.return_value = ("adk-auth-exp-1@switon.altostrat.com", False)
 
         captured_role = "should_be_none"
 
@@ -498,7 +498,7 @@ class TestMiddlewareDatabaseRole(unittest.TestCase):
     @patch("spanner_agent.auth_wrapper._resolve_user_email")
     def test_middleware_no_role_when_email_resolution_fails(self, mock_resolve):
         """Middleware should handle email resolution failure gracefully."""
-        mock_resolve.return_value = None
+        mock_resolve.return_value = (None, False)
 
         captured_role = "should_be_none"
 
