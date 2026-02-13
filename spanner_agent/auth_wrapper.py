@@ -40,6 +40,7 @@ import google.auth
 import google.cloud.spanner_v1.instance
 import google.oauth2.credentials
 import httpx
+from google.cloud.spanner_admin_database_v1.types import DatabaseDialect
 from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.tools.base_tool import BaseTool
 from google.adk.tools.base_toolset import BaseToolset, ToolPredicate
@@ -124,7 +125,16 @@ _original_instance_database = _Instance.database
 
 
 def _patched_instance_database(self, database_id, *args, **kwargs):
-    """Wrapper that injects ``database_role`` from the ContextVar."""
+    """Wrapper that injects ``database_role`` and pre-sets database dialect.
+
+    Injects the FGAC ``database_role`` from the ContextVar when set.
+
+    Pre-sets ``_database_dialect`` to ``GOOGLE_STANDARD_SQL`` on the
+    returned ``Database`` object.  Without this, the first access to
+    ``Database.database_dialect`` triggers ``reload()`` → ``getDdl``,
+    which requires ``spanner.databases.getDdl`` — a permission that
+    FGAC database roles typically lack.
+    """
     db_role = _current_database_role.get()
     if db_role and "database_role" not in kwargs:
         logger.info(
@@ -133,7 +143,18 @@ def _patched_instance_database(self, database_id, *args, **kwargs):
             database_id,
         )
         kwargs["database_role"] = db_role
-    return _original_instance_database(self, database_id, *args, **kwargs)
+    db = _original_instance_database(self, database_id, *args, **kwargs)
+    # Pre-set dialect to avoid reload() → getDdl admin API call.
+    if (
+        hasattr(db, "_database_dialect")
+        and db._database_dialect == DatabaseDialect.DATABASE_DIALECT_UNSPECIFIED
+    ):
+        db._database_dialect = DatabaseDialect.GOOGLE_STANDARD_SQL
+        logger.info(
+            "[AUTH] Pre-set database_dialect=GOOGLE_STANDARD_SQL for %s",
+            database_id,
+        )
+    return db
 
 
 _Instance.database = _patched_instance_database

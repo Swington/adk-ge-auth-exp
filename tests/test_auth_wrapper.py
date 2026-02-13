@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import google.oauth2.credentials
 from google.adk.tools.google_tool import GoogleTool
+from google.cloud.spanner_admin_database_v1.types import DatabaseDialect
 
 from spanner_agent.auth_wrapper import (
     AuthTokenExtractorMiddleware,
@@ -348,6 +349,72 @@ class TestDatabaseRoleContextVar(unittest.TestCase):
     def test_patched_database_no_role_when_not_set(self):
         _current_database_role.set(None)
         self.assertIsNone(_current_database_role.get())
+
+
+class TestDatabaseDialectPreset(unittest.TestCase):
+    """Verify _patched_instance_database pre-sets database dialect.
+
+    The Spanner client's Database.database_dialect property triggers
+    reload() → getDdl when dialect is UNSPECIFIED. FGAC database roles
+    don't have getDdl permission, so we pre-set the dialect to
+    GOOGLE_STANDARD_SQL to avoid the admin API call.
+    """
+
+    def tearDown(self):
+        _current_database_role.set(None)
+
+    def test_presets_dialect_to_google_standard_sql(self):
+        """Returned database has _database_dialect set to GOOGLE_STANDARD_SQL."""
+        mock_db = MagicMock()
+        mock_db._database_dialect = DatabaseDialect.DATABASE_DIALECT_UNSPECIFIED
+        mock_instance = MagicMock()
+        _original_instance_database.return_value = mock_db
+
+        with patch(
+            "spanner_agent.auth_wrapper._original_instance_database",
+            return_value=mock_db,
+        ):
+            result = _patched_instance_database(mock_instance, "test-db")
+
+        self.assertEqual(
+            result._database_dialect, DatabaseDialect.GOOGLE_STANDARD_SQL
+        )
+
+    def test_preserves_explicit_dialect(self):
+        """If dialect is already set (not UNSPECIFIED), don't override it."""
+        mock_db = MagicMock()
+        mock_db._database_dialect = DatabaseDialect.POSTGRESQL
+        mock_instance = MagicMock()
+
+        with patch(
+            "spanner_agent.auth_wrapper._original_instance_database",
+            return_value=mock_db,
+        ):
+            result = _patched_instance_database(mock_instance, "test-db")
+
+        self.assertEqual(result._database_dialect, DatabaseDialect.POSTGRESQL)
+
+    def test_dialect_preset_works_with_role_injection(self):
+        """Both dialect preset and role injection work together."""
+        _current_database_role.set("employees_reader")
+        mock_db = MagicMock()
+        mock_db._database_dialect = DatabaseDialect.DATABASE_DIALECT_UNSPECIFIED
+        mock_instance = MagicMock()
+
+        with patch(
+            "spanner_agent.auth_wrapper._original_instance_database",
+            return_value=mock_db,
+        ) as mock_orig:
+            result = _patched_instance_database(mock_instance, "test-db")
+
+        # Role injected
+        mock_orig.assert_called_once_with(
+            mock_instance, "test-db", database_role="employees_reader"
+        )
+        # Dialect preset
+        self.assertEqual(
+            result._database_dialect, DatabaseDialect.GOOGLE_STANDARD_SQL
+        )
 
 
 class TestMiddlewareDatabaseRole(unittest.TestCase):
