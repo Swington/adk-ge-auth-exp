@@ -515,5 +515,25 @@ class TestCredentialsManagerFromState(unittest.TestCase):
         mock_resolve.assert_not_called()
 
 
+# --------------------------------------------------------------------------
+# AdkApp monkey-patch for Agent Engine kwargs compatibility
+# --------------------------------------------------------------------------
+class TestAdkAppPatch(unittest.TestCase):
+    def test_patched_method_exists(self):
+        """The AdkApp monkey-patch was applied at import time."""
+        from vertexai.agent_engines import AdkApp
+
+        method = getattr(AdkApp, "streaming_agent_run_with_events", None)
+        self.assertIsNotNone(method)
+        # The patched method should accept **kwargs
+        import inspect
+
+        sig = inspect.signature(method)
+        param_names = list(sig.parameters.keys())
+        # Should have 'self', 'request_json', and '**kwargs'
+        self.assertIn("request_json", param_names)
+        self.assertIn("kwargs", param_names)
+
+
 if __name__ == "__main__":
     unittest.main()

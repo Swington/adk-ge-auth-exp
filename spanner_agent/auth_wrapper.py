@@ -346,3 +346,32 @@ class BearerTokenSpannerToolset(BaseToolset):
     async def close(self) -> None:
         """Delegate to the inner toolset."""
         await self._inner_toolset.close()
+
+
+# ---------------------------------------------------------------------------
+# Monkey-patch AdkApp for Agent Engine compatibility
+# ---------------------------------------------------------------------------
+# The Agent Engine runtime's framework calls
+# streaming_agent_run_with_events(**payload) with keyword arguments
+# (including 'authorizations'), but the deployed SDK's AdkApp only accepts
+# streaming_agent_run_with_events(request_json: str).
+# This patch bridges the gap so authorization tokens reach the agent.
+try:
+    import json as _json
+
+    from vertexai.agent_engines import AdkApp as _AdkApp
+
+    _original_streaming = _AdkApp.streaming_agent_run_with_events
+
+    async def _patched_streaming_agent_run(self, request_json=None, **kwargs):
+        """Accept both JSON string and keyword argument calling conventions."""
+        if request_json is None and kwargs:
+            request_json = _json.dumps(kwargs)
+            logger.info("[AUTH] Converted Agent Engine kwargs to request_json")
+        async for event in _original_streaming(self, request_json):
+            yield event
+
+    _AdkApp.streaming_agent_run_with_events = _patched_streaming_agent_run
+    logger.info("[AUTH] Patched AdkApp.streaming_agent_run_with_events")
+except ImportError:
+    pass  # vertexai not installed (e.g. Cloud Run without agent_engines)
