@@ -1,4 +1,4 @@
-"""Custom server entry point for Cloud Run deployment.
+"""Custom server entry point with Bearer token middleware.
 
 Wraps the ADK web server with AuthTokenExtractorMiddleware so the
 Bearer token sent by Gemini Enterprise (in the HTTP Authorization
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 inner_app = get_fast_api_app(
     agents_dir=".",
-    web=False,
+    web=True,
     a2a=True,
 )
 

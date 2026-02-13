@@ -1,0 +1,28 @@
+{
+  "name": "Spanner Data Agent",
+  "description": "An agent that queries Cloud Spanner databases using the end-user's credentials propagated from Gemini Enterprise.",
+  "url": "http://localhost:8000/a2a/spanner_agent",
+  "version": "0.1.0",
+  "protocol_version": "0.3.0",
+  "preferred_transport": "JSONRPC",
+  "capabilities": {
+    "streaming": false,
+    "push_notifications": false,
+    "state_transition_history": false
+  },
+  "default_input_modes": ["text/plain"],
+  "default_output_modes": ["text/plain"],
+  "skills": [
+    {
+      "id": "spanner_query",
+      "name": "Spanner Query",
+      "description": "Query a Cloud Spanner database. Can list tables, show schemas, and run SQL queries.",
+      "tags": ["spanner", "database", "sql"],
+      "examples": [
+        "List all tables in the database",
+        "Show the schema of the employees table",
+        "SELECT * FROM employees LIMIT 5"
+      ]
+    }
+  ]
+}
