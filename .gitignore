@@ -1,4 +1,4 @@
-# Python-generated files
+# Python
 __pycache__/
 *.py[oc]
 build/
@@ -7,10 +7,21 @@ wheels/
 *.egg-info
 
 # Virtual environments
-.venv
+.venv/
 
 # Environment files
 .env
 
-# Claude
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# ADK local state
+spanner_agent/.adk/
+
+# Claude Code
 .claude/
+
+# Logs
+*.log
