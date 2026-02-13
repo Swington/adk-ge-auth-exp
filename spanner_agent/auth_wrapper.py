@@ -1,8 +1,15 @@
 """Bearer token credential propagation for SpannerToolset.
 
 When Gemini Enterprise invokes the agent via A2A, it includes the end-user's
-OAuth access token in the HTTP Authorization header (Bearer <token>).  This
-module:
+OAuth access token.  On Cloud Run (where the ``Authorization`` header is
+consumed by Cloud Run's own IAM authentication), the user's access token is
+expected in the ``X-User-Authorization`` header instead.
+
+Header priority (first match wins):
+    1. ``X-User-Authorization: Bearer <token>``   – used on Cloud Run
+    2. ``Authorization: Bearer <token>``           – used locally / direct calls
+
+This module:
 
 1.  Provides ASGI middleware (AuthTokenExtractorMiddleware) that extracts the
     Bearer token and stores it in a contextvars.ContextVar so it is visible
@@ -59,7 +66,11 @@ def set_bearer_token(token: Optional[str]) -> contextvars.Token:
 # ASGI Middleware
 # ---------------------------------------------------------------------------
 class AuthTokenExtractorMiddleware:
-    """ASGI middleware that pulls the Bearer token from the Authorization header.
+    """ASGI middleware that pulls the end-user's Bearer token from headers.
+
+    Checks ``X-User-Authorization`` first (for Cloud Run deployments where
+    ``Authorization`` is consumed by Cloud Run IAM), then falls back to
+    ``Authorization``.
 
     Stores the token in ``_current_bearer_token`` so downstream code (running
     in the same async context) can access it via ``get_bearer_token()``.
@@ -68,6 +79,25 @@ class AuthTokenExtractorMiddleware:
     def __init__(self, app: Any) -> None:
         self.app = app
 
+    @staticmethod
+    def _extract_bearer(headers: dict[bytes, bytes]) -> tuple[str | None, str]:
+        """Extract Bearer token from headers.
+
+        Returns (token, source_header) or (None, '').
+        Priority: X-User-Authorization > Authorization.
+        """
+        # Check X-User-Authorization first (Cloud Run deployment)
+        user_auth = headers.get(b"x-user-authorization", b"").decode()
+        if user_auth.lower().startswith("bearer "):
+            return user_auth[7:], "X-User-Authorization"
+
+        # Fall back to Authorization (local / unauthenticated deployment)
+        auth = headers.get(b"authorization", b"").decode()
+        if auth.lower().startswith("bearer "):
+            return auth[7:], "Authorization"
+
+        return None, ""
+
     async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
@@ -75,13 +105,13 @@ class AuthTokenExtractorMiddleware:
 
         # ASGI headers are [(name_bytes, value_bytes), …]
         headers = dict(scope.get("headers", []))
-        auth_value = headers.get(b"authorization", b"").decode()
+        token, source = self._extract_bearer(headers)
 
-        if auth_value.lower().startswith("bearer "):
-            token = auth_value[7:]
+        if token:
             logger.info(
-                "[AUTH-MIDDLEWARE] Extracted Bearer token from Authorization "
+                "[AUTH-MIDDLEWARE] Extracted Bearer token from %s "
                 "header (length=%d, first_20_chars=%s…)",
+                source,
                 len(token),
                 token[:20],
             )
@@ -91,6 +121,7 @@ class AuthTokenExtractorMiddleware:
             finally:
                 _current_bearer_token.reset(reset)
         else:
+            auth_value = headers.get(b"authorization", b"").decode()
             if auth_value:
                 logger.info(
                     "[AUTH-MIDDLEWARE] Authorization header present but not "

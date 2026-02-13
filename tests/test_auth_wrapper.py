@@ -154,6 +154,43 @@ class TestAuthTokenExtractorMiddleware(unittest.TestCase):
         self._run(middleware(scope, None, None))
         self.assertTrue(called)
 
+    def test_x_user_authorization_takes_priority(self):
+        """X-User-Authorization should be preferred over Authorization."""
+        captured_token = None
+
+        async def fake_app(scope, receive, send):
+            nonlocal captured_token
+            captured_token = get_bearer_token()
+
+        middleware = AuthTokenExtractorMiddleware(fake_app)
+        scope = {
+            "type": "http",
+            "headers": [
+                (b"authorization", b"Bearer identity-token-jwt"),
+                (b"x-user-authorization", f"Bearer {FAKE_TOKEN}".encode()),
+            ],
+        }
+        self._run(middleware(scope, None, None))
+        self.assertEqual(captured_token, FAKE_TOKEN)
+
+    def test_x_user_authorization_alone(self):
+        """X-User-Authorization without Authorization should work."""
+        captured_token = None
+
+        async def fake_app(scope, receive, send):
+            nonlocal captured_token
+            captured_token = get_bearer_token()
+
+        middleware = AuthTokenExtractorMiddleware(fake_app)
+        scope = {
+            "type": "http",
+            "headers": [
+                (b"x-user-authorization", f"Bearer {FAKE_TOKEN}".encode()),
+            ],
+        }
+        self._run(middleware(scope, None, None))
+        self.assertEqual(captured_token, FAKE_TOKEN)
+
 
 # --------------------------------------------------------------------------
 # BearerTokenCredentialsManager
