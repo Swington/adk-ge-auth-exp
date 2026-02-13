@@ -105,6 +105,16 @@ class AuthTokenExtractorMiddleware:
 
         # ASGI headers are [(name_bytes, value_bytes), …]
         headers = dict(scope.get("headers", []))
+
+        # Log all header names for debugging Gemini Enterprise requests
+        header_names = [k.decode() for k in headers.keys()]
+        logger.info(
+            "[AUTH-MIDDLEWARE] Request %s %s — headers: %s",
+            scope.get("method", "?"),
+            scope.get("path", "?"),
+            header_names,
+        )
+
         token, source = self._extract_bearer(headers)
 
         if token:
