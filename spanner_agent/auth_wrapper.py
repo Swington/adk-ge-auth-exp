@@ -1,24 +1,16 @@
-"""Bearer token credential propagation for SpannerToolset.
+"""Bearer token credential propagation for SpannerToolset (Cloud Run / A2A).
 
-Supports two deployment modes:
-
-**Cloud Run** (A2A protocol):
-    The end-user's OAuth access token arrives in HTTP headers.
-    ``AuthTokenExtractorMiddleware`` extracts it into a ContextVar.
-
-**Agent Engine** (Vertex AI managed runtime):
-    The token arrives via the ``authorizations`` field in the request JSON.
-    ``AdkApp._init_session`` stores it in ``session.state[auth_id]``.
-    The credentials manager reads it from ``tool_context.state``.
+The end-user's OAuth access token arrives in HTTP headers when Gemini
+Enterprise invokes the agent via A2A on Cloud Run.
 
 Components:
 
-1.  **AuthTokenExtractorMiddleware** — ASGI middleware (Cloud Run only) that
-    extracts the Bearer token and stores it in a ContextVar.
+1.  **AuthTokenExtractorMiddleware** — ASGI middleware that extracts the
+    Bearer token from ``X-User-Authorization`` (or ``Authorization``) and
+    stores it in a ContextVar.
 
 2.  **BearerTokenCredentialsManager** — drop-in replacement for ADK's
-    ``GoogleCredentialsManager``; reads the token from the ContextVar
-    (Cloud Run) or ``tool_context.state`` (Agent Engine).
+    ``GoogleCredentialsManager``; reads the token from the ContextVar.
 
 3.  **BearerTokenSpannerToolset** — ``BaseToolset`` wrapper that creates an
     inner ``SpannerToolset`` and replaces ``_credentials_manager`` on every
@@ -310,10 +302,6 @@ _DatabaseAdminClient.get_database_ddl = _blocked_get_database_ddl
 # instead of the project ID string.  This callback normalizes the
 # ``project_id`` argument before the tool executes.
 # Map of known project numbers → project ID strings.
-# On Agent Engine, GOOGLE_CLOUD_PROJECT is often set to the project *number*
-# (e.g. "535816463745") rather than the project *ID* (e.g. "switon-gsd-demos").
-# The Spanner client fails with sessions.create PERMISSION_DENIED when given
-# a numeric project with user-scoped OAuth2 credentials.
 _PROJECT_NUMBER_TO_ID: Dict[str, str] = {
     "535816463745": "switon-gsd-demos",
 }
@@ -429,85 +417,27 @@ class AuthTokenExtractorMiddleware:
             _current_database_role.reset(reset_role)
 
 
-# Min length for a value to be considered an OAuth access token
-_MIN_TOKEN_LENGTH = 20
-
-
-def _resolve_and_set_database_role(token: str) -> None:
-    """Resolve user email from token and set the FGAC database_role ContextVar.
-
-    Called lazily by the credential manager in Agent Engine mode (where no
-    middleware has set the role).  Skipped if the role is already set
-    (Cloud Run mode — the middleware already resolved it).
-    """
-    if _current_database_role.get() is not None:
-        return  # already set (by middleware or earlier call)
-    email = _resolve_user_email(token)
-    if email:
-        db_role = USER_DATABASE_ROLE_MAP.get(email)
-        if db_role:
-            logger.info("[AUTH] %s → database_role=%s", email, db_role)
-            _current_database_role.set(db_role)
-
-
 # ---------------------------------------------------------------------------
 # Credentials manager (duck-types GoogleCredentialsManager)
 # ---------------------------------------------------------------------------
 class BearerTokenCredentialsManager:
     """Returns ``google.oauth2.credentials.Credentials`` from the Bearer token.
 
-    Token sources (checked in order):
-    1. ContextVar ``_current_bearer_token`` — set by ASGI middleware (Cloud Run)
-    2. ``tool_context.state`` — set by ``AdkApp._init_session`` (Agent Engine)
+    Reads the token from the ContextVar ``_current_bearer_token`` which is
+    set by ``AuthTokenExtractorMiddleware`` on each incoming HTTP request.
 
     If no token is found, returns ``None`` — which causes
     ``GoogleTool.run_async`` to return an "authorization required" message.
     """
 
-    @staticmethod
-    def _extract_token_from_state(tool_context: Any) -> Optional[str]:
-        """Extract an OAuth access token from tool_context.state.
-
-        In Agent Engine, ``AdkApp._init_session`` stores authorization
-        tokens in session state keyed by authorization resource ID.
-        We find the first string value that looks like a token.
-
-        The ADK ``State`` class doesn't support ``.values()`` — we use
-        ``.to_dict()`` (if available) or fall back to treating it as a
-        plain dict.
-        """
-        if not tool_context or not hasattr(tool_context, "state"):
-            return None
-        state = tool_context.state
-        if not state:
-            return None
-        # State is an ADK State object (to_dict) or a plain dict (values)
-        items = (
-            state.to_dict().values()
-            if hasattr(state, "to_dict")
-            else state.values()
-        )
-        for value in items:
-            if isinstance(value, str) and len(value) >= _MIN_TOKEN_LENGTH:
-                return value
-        return None
-
     async def get_valid_credentials(
         self, tool_context: Any
     ) -> Optional[google.oauth2.credentials.Credentials]:
-        # 1. Cloud Run path: token from ContextVar (set by middleware)
         token = get_bearer_token()
-
-        # 2. Agent Engine path: token from session state
-        if not token:
-            token = self._extract_token_from_state(tool_context)
 
         if not token:
             logger.warning("[AUTH] No Bearer token available for Spanner call")
             return None
-
-        # Lazy FGAC resolution (Agent Engine path — middleware didn't run)
-        _resolve_and_set_database_role(token)
 
         return google.oauth2.credentials.Credentials(token=token)
 
@@ -565,32 +495,3 @@ class BearerTokenSpannerToolset(BaseToolset):
     async def close(self) -> None:
         """Delegate to the inner toolset."""
         await self._inner_toolset.close()
-
-
-# ---------------------------------------------------------------------------
-# Monkey-patch AdkApp for Agent Engine compatibility
-# ---------------------------------------------------------------------------
-# The Agent Engine runtime's framework calls
-# streaming_agent_run_with_events(**payload) with keyword arguments
-# (including 'authorizations'), but the deployed SDK's AdkApp only accepts
-# streaming_agent_run_with_events(request_json: str).
-# This patch bridges the gap so authorization tokens reach the agent.
-try:
-    import json as _json
-
-    from vertexai.agent_engines import AdkApp as _AdkApp
-
-    _original_streaming = _AdkApp.streaming_agent_run_with_events
-
-    async def _patched_streaming_agent_run(self, request_json=None, **kwargs):
-        """Accept both JSON string and keyword argument calling conventions."""
-        if request_json is None and kwargs:
-            request_json = _json.dumps(kwargs)
-            logger.info("[AUTH] Converted Agent Engine kwargs to request_json")
-        async for event in _original_streaming(self, request_json):
-            yield event
-
-    _AdkApp.streaming_agent_run_with_events = _patched_streaming_agent_run
-    logger.info("[AUTH] Patched AdkApp.streaming_agent_run_with_events")
-except ImportError:
-    pass  # vertexai not installed (e.g. Cloud Run without agent_engines)

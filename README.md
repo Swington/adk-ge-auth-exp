@@ -1,20 +1,16 @@
 # ADK Spanner Agent — Per-User Auth & FGAC Demo
 
-A Google [ADK](https://google.github.io/adk-docs/) agent that queries Cloud Spanner, deployable on **Cloud Run** (A2A) or **Agent Engine** (Vertex AI). Connected to Gemini Enterprise for end-user credential propagation. Demonstrates **per-user credential propagation** and **Spanner Fine-Grained Access Control (FGAC)** so that different users see different data depending on their IAM permissions.
+A Google [ADK](https://google.github.io/adk-docs/) agent that queries Cloud Spanner, deployed on **Cloud Run** via A2A protocol. Connected to Gemini Enterprise for end-user credential propagation. Demonstrates **per-user credential propagation** and **Spanner Fine-Grained Access Control (FGAC)** so that different users see different data depending on their IAM permissions.
 
 ## Problem Statement
 
 When Gemini Enterprise invokes an ADK agent, the end-user's OAuth access token is forwarded. By default ADK's `SpannerToolset` uses the service account's credentials for all Spanner calls, meaning every user gets the same access level. This project shows how to:
 
-1. **Extract** the end-user's Bearer token (from HTTP headers on Cloud Run, or from session state on Agent Engine).
+1. **Extract** the end-user's Bearer token from HTTP headers on Cloud Run.
 2. **Propagate** that token as the Spanner credential so IAM is enforced per-user.
 3. **Inject** a Spanner `database_role` for users who require FGAC.
 
 ## Architecture
-
-The agent supports two deployment modes with a shared credential manager:
-
-### Cloud Run (A2A protocol)
 
 ```
 Gemini Enterprise
@@ -36,23 +32,6 @@ Gemini Enterprise
   Cloud Spanner (IAM + FGAC per user)
 ```
 
-### Agent Engine (Vertex AI managed runtime)
-
-```
-Gemini Enterprise / AgentSpace
-       │  streaming_agent_run_with_events(request_json)
-       │  request.authorizations = {auth_id: {access_token: "..."}}
-       ▼
-  AdkApp._init_session()
-    └─ stores token in session.state[auth_id]
-       │
-  Agent → BearerTokenSpannerToolset
-    └─ reads token from tool_context.state
-    └─ lazily resolves email → database_role
-       │
-  Cloud Spanner (IAM + FGAC per user)
-```
-
 ## Test Users
 
 | User | SA for integration tests | Spanner Access |
@@ -69,7 +48,6 @@ Gemini Enterprise / AgentSpace
 | Cloud Run service | `adk-spanner-agent` (us-central1) |
 | Cloud Run URL | `https://adk-spanner-agent-535816463745.us-central1.run.app` |
 | Cloud Run SA | `adk-spanner-agent@switon-gsd-demos.iam.gserviceaccount.com` (no Spanner access) |
-| Agent Engine | `projects/535816463745/locations/us-central1/reasoningEngines/5919158175969312768` |
 | Spanner instance | `adk-auth-exp` (us-central1) |
 | Spanner database | `demo-db` |
 
@@ -96,7 +74,6 @@ adk-auth-exp/
 │   ├── __init__.py
 │   ├── agent.py                     # ADK Agent definition
 │   ├── agent.json                   # A2A agent card
-│   ├── agent_engine_app.py          # Agent Engine entry point (AdkApp)
 │   └── auth_wrapper.py              # Bearer token credential manager, FGAC, middleware
 └── tests/
     ├── test_auth_wrapper.py          # Unit tests (mocked, no GCP calls)
@@ -151,18 +128,6 @@ gcloud run deploy adk-spanner-agent \
 ```
 
 `--no-invoker-iam-check` is required because Gemini Enterprise sends the user's OAuth token in `Authorization`, and Cloud Run IAM would otherwise reject it (it's not an identity token).
-
-## Deploying to Agent Engine
-
-```bash
-adk deploy agent_engine \
-  --project=switon-gsd-demos \
-  --region=us-central1 \
-  --trace_to_cloud \
-  spanner_agent
-```
-
-Agent Engine deployment uses `spanner_agent/agent_engine_app.py` as the entry point. The `AdkApp` wrapper provides session management and the `streaming_agent_run_with_events` method for AgentSpace invocation. User credentials are passed via the `authorizations` field in the request and stored in session state.
 
 ## Connecting to Gemini Enterprise
 

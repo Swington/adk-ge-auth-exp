@@ -1,4 +1,4 @@
-"""Unit tests for Bearer token credential propagation.
+"""Unit tests for Bearer token credential propagation (Cloud Run / A2A).
 
 Tests the auth pipeline:
 1. ContextVar token storage (set/get/reset)
@@ -7,7 +7,6 @@ Tests the auth pipeline:
 4. BearerTokenSpannerToolset replaces _credentials_manager on tools
 5. FGAC database_role ContextVar and USER_DATABASE_ROLE_MAP
 6. Middleware sets database_role based on resolved email
-7. Agent Engine path: token from tool_context.state + lazy FGAC resolution
 """
 
 import asyncio
@@ -364,7 +363,7 @@ class TestDatabaseDialectPreset(unittest.TestCase):
     """Verify _patched_instance_database pre-sets database dialect.
 
     The Spanner client's Database.database_dialect property triggers
-    reload() → getDdl when dialect is UNSPECIFIED. FGAC database roles
+    reload() -> getDdl when dialect is UNSPECIFIED. FGAC database roles
     don't have getDdl permission, so we pre-set the dialect to
     GOOGLE_STANDARD_SQL via the constructor kwarg.
     """
@@ -507,22 +506,12 @@ class TestResolveProjectId(unittest.TestCase):
 
 
 class TestDatabaseDialectPropertyPatch(unittest.TestCase):
-    """Verify Database.database_dialect property never triggers getDdl.
-
-    The Spanner client's Database.database_dialect property calls reload()
-    when dialect is DATABASE_DIALECT_UNSPECIFIED, which requires the
-    spanner.databases.getDdl IAM permission. FGAC roles and user-scoped
-    OAuth credentials typically lack this permission.
-
-    Our patch makes the property return GOOGLE_STANDARD_SQL instead of
-    calling reload() when the dialect is unspecified.
-    """
+    """Verify Database.database_dialect property never triggers getDdl."""
 
     def test_property_returns_google_standard_sql_when_unspecified(self):
         """When _database_dialect is UNSPECIFIED, property returns GOOGLE_STANDARD_SQL."""
         db = MagicMock(spec=google.cloud.spanner_v1.database.Database)
         db._database_dialect = DatabaseDialect.DATABASE_DIALECT_UNSPECIFIED
-        # Call the actual patched property (bound to the class)
         result = google.cloud.spanner_v1.database.Database.database_dialect.fget(db)
         self.assertEqual(result, DatabaseDialect.GOOGLE_STANDARD_SQL)
 
@@ -612,12 +601,7 @@ class TestDatabaseExistsPatch(unittest.TestCase):
 
 
 class TestGetDatabaseDdlBlocked(unittest.TestCase):
-    """Verify DatabaseAdminClient.get_database_ddl is blocked at the API level.
-
-    This is the nuclear defense-in-depth patch: even if all higher-level patches
-    (property, reload, exists) are somehow bypassed, the API call itself returns
-    an empty DDL response instead of hitting Spanner admin API.
-    """
+    """Verify DatabaseAdminClient.get_database_ddl is blocked at the API level."""
 
     def test_admin_client_method_is_patched(self):
         """DatabaseAdminClient.get_database_ddl is our blocked version."""
@@ -647,7 +631,6 @@ class TestGetDatabaseDdlBlocked(unittest.TestCase):
         """The blocked method does not make any API calls."""
         mock_client = MagicMock()
         _blocked_get_database_ddl(mock_client, database="test-db")
-        # No transport calls should be made
         mock_client._transport.assert_not_called()
 
 
@@ -705,135 +688,6 @@ class TestMiddlewareDatabaseRole(unittest.TestCase):
         }
         _run(middleware(scope, None, None))
         self.assertIsNone(captured["role"])
-
-
-# --------------------------------------------------------------------------
-# Agent Engine path: token from tool_context.state
-# --------------------------------------------------------------------------
-class TestCredentialsManagerFromState(unittest.TestCase):
-    """BearerTokenCredentialsManager reads token from tool_context.state
-    when ContextVar is empty (Agent Engine deployment path).
-    """
-
-    def setUp(self):
-        self.manager = BearerTokenCredentialsManager()
-
-    def tearDown(self):
-        _current_bearer_token.set(None)
-        _current_database_role.set(None)
-
-    def test_reads_token_from_state(self):
-        """When ContextVar is empty, reads token from tool_context.state."""
-        ctx = _make_tool_context("user@example.com")
-        ctx.state = {"my_auth_resource": FAKE_TOKEN}
-        creds = _run(self.manager.get_valid_credentials(ctx))
-        self.assertIsNotNone(creds)
-        self.assertEqual(creds.token, FAKE_TOKEN)
-
-    def test_contextvar_takes_priority_over_state(self):
-        """ContextVar (Cloud Run) takes priority over state (Agent Engine)."""
-        set_bearer_token("contextvar-token")
-        ctx = _make_tool_context("user@example.com")
-        ctx.state = {"my_auth_resource": "state-token"}
-        creds = _run(self.manager.get_valid_credentials(ctx))
-        self.assertEqual(creds.token, "contextvar-token")
-
-    def test_returns_none_when_state_empty(self):
-        ctx = _make_tool_context("user@example.com")
-        ctx.state = {}
-        creds = _run(self.manager.get_valid_credentials(ctx))
-        self.assertIsNone(creds)
-
-    def test_returns_none_when_no_tool_context(self):
-        creds = _run(self.manager.get_valid_credentials(None))
-        self.assertIsNone(creds)
-
-    def test_skips_non_string_state_values(self):
-        ctx = _make_tool_context("user@example.com")
-        ctx.state = {"counter": 42, "flag": True}
-        creds = _run(self.manager.get_valid_credentials(ctx))
-        self.assertIsNone(creds)
-
-    def test_skips_short_string_state_values(self):
-        """Short strings are not access tokens."""
-        ctx = _make_tool_context("user@example.com")
-        ctx.state = {"status": "ok", "mode": "read"}
-        creds = _run(self.manager.get_valid_credentials(ctx))
-        self.assertIsNone(creds)
-
-    def test_reads_token_from_adk_state_object(self):
-        """Works with ADK State objects that have to_dict() instead of values()."""
-        ctx = _make_tool_context("user@example.com")
-        # Simulate ADK State object (has to_dict but no values)
-        mock_state = MagicMock()
-        mock_state.__bool__ = MagicMock(return_value=True)
-        mock_state.to_dict.return_value = {"auth_id_123": FAKE_TOKEN}
-        del mock_state.values  # State doesn't have .values()
-        ctx.state = mock_state
-        creds = _run(self.manager.get_valid_credentials(ctx))
-        self.assertIsNotNone(creds)
-        self.assertEqual(creds.token, FAKE_TOKEN)
-
-    @patch("spanner_agent.auth_wrapper._resolve_user_email")
-    def test_sets_fgac_role_from_state_token(self, mock_resolve):
-        """Agent Engine path: resolves email and sets database_role.
-
-        ContextVar changes inside an asyncio Task are isolated, so we
-        capture the value inside the coroutine.
-        """
-        mock_resolve.return_value = "adk-auth-exp-3@switon.altostrat.com"
-        ctx = _make_tool_context("user@example.com")
-        ctx.state = {"my_auth_resource": FAKE_TOKEN}
-
-        async def run_and_capture():
-            creds = await self.manager.get_valid_credentials(ctx)
-            return creds, _current_database_role.get()
-
-        creds, role = _run(run_and_capture())
-        self.assertIsNotNone(creds)
-        self.assertEqual(role, "employees_reader")
-
-    @patch("spanner_agent.auth_wrapper._resolve_user_email")
-    def test_no_fgac_role_for_regular_user_from_state(self, mock_resolve):
-        mock_resolve.return_value = "adk-auth-exp-1@switon.altostrat.com"
-        ctx = _make_tool_context("user@example.com")
-        ctx.state = {"my_auth_resource": FAKE_TOKEN}
-
-        async def run_and_capture():
-            await self.manager.get_valid_credentials(ctx)
-            return _current_database_role.get()
-
-        role = _run(run_and_capture())
-        self.assertIsNone(role)
-
-    @patch("spanner_agent.auth_wrapper._resolve_user_email")
-    def test_skips_fgac_when_contextvar_already_set(self, mock_resolve):
-        """Cloud Run path: middleware already set the role, don't re-resolve."""
-        set_bearer_token(FAKE_TOKEN)
-        _current_database_role.set("employees_reader")
-        ctx = _make_tool_context("user@example.com")
-        _run(self.manager.get_valid_credentials(ctx))
-        mock_resolve.assert_not_called()
-
-
-# --------------------------------------------------------------------------
-# AdkApp monkey-patch for Agent Engine kwargs compatibility
-# --------------------------------------------------------------------------
-class TestAdkAppPatch(unittest.TestCase):
-    def test_patched_method_exists(self):
-        """The AdkApp monkey-patch was applied at import time."""
-        from vertexai.agent_engines import AdkApp
-
-        method = getattr(AdkApp, "streaming_agent_run_with_events", None)
-        self.assertIsNotNone(method)
-        # The patched method should accept **kwargs
-        import inspect
-
-        sig = inspect.signature(method)
-        param_names = list(sig.parameters.keys())
-        # Should have 'self', 'request_json', and '**kwargs'
-        self.assertIn("request_json", param_names)
-        self.assertIn("kwargs", param_names)
 
 
 if __name__ == "__main__":
