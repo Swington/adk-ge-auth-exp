@@ -220,6 +220,10 @@ def _safe_reload(self):
     The upstream ``reload()`` calls both ``get_database_ddl()`` and
     ``get_database()``.  We skip the DDL call since it requires
     ``spanner.databases.getDdl`` which user-scoped credentials lack.
+
+    Adapted from ``google-cloud-spanner`` v3.62.0
+    (``Database.reload`` in ``google/cloud/spanner_v1/database.py``).
+    If upgrading the library, verify this implementation still matches.
     """
     from google.cloud.spanner_v1.database import _metadata_with_prefix
     from google.cloud.spanner_admin_database_v1.types import (

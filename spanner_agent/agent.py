@@ -15,9 +15,21 @@ from .auth_wrapper import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-PROJECT_ID = _resolve_project_id(os.environ.get("GOOGLE_CLOUD_PROJECT", ""))
-SPANNER_INSTANCE_ID = os.environ.get("SPANNER_INSTANCE_ID", "")
-SPANNER_DATABASE_ID = os.environ.get("SPANNER_DATABASE_ID", "")
+_REQUIRED_ENV_VARS = [
+    "GOOGLE_CLOUD_PROJECT",
+    "SPANNER_INSTANCE_ID",
+    "SPANNER_DATABASE_ID",
+]
+_missing = [v for v in _REQUIRED_ENV_VARS if not os.environ.get(v)]
+if _missing:
+    raise RuntimeError(
+        f"Missing required environment variable(s): {', '.join(_missing)}. "
+        "See .env.example for the full list."
+    )
+
+PROJECT_ID = _resolve_project_id(os.environ["GOOGLE_CLOUD_PROJECT"])
+SPANNER_INSTANCE_ID = os.environ["SPANNER_INSTANCE_ID"]
+SPANNER_DATABASE_ID = os.environ["SPANNER_DATABASE_ID"]
 
 spanner_toolset = BearerTokenSpannerToolset(
     spanner_tool_settings=SpannerToolSettings(
