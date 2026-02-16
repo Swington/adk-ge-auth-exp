@@ -1,17 +1,19 @@
+import os
 import unittest
+
 import google.auth
 import google.auth.impersonated_credentials
-from google.cloud import spanner
 from google.api_core.exceptions import PermissionDenied
+from google.cloud import spanner
 
-PROJECT_ID = "switon-gsd-demos"
-INSTANCE_ID = "adk-auth-exp"
-DATABASE_ID = "demo-db"
+PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
+INSTANCE_ID = os.environ.get("SPANNER_INSTANCE_ID", "")
+DATABASE_ID = os.environ.get("SPANNER_DATABASE_ID", "")
 
-# Service Accounts
-SA_ADMIN = "user1-full-access@switon-gsd-demos.iam.gserviceaccount.com"
-SA_NO_ACCESS = "user2-no-access@switon-gsd-demos.iam.gserviceaccount.com"
-SA_STANDARD = "user3-fgac@switon-gsd-demos.iam.gserviceaccount.com"
+# Service Accounts — set via environment variables
+SA_ADMIN = os.environ.get("TEST_SA_FULL_ACCESS", "")
+SA_NO_ACCESS = os.environ.get("TEST_SA_NO_ACCESS", "")
+SA_STANDARD = os.environ.get("TEST_SA_FGAC", "")
 
 class TestSpannerIsolation(unittest.TestCase):
     @classmethod

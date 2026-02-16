@@ -16,6 +16,7 @@ Run:
 
 import json
 import logging
+import os
 import subprocess
 import uuid
 
@@ -27,13 +28,13 @@ import pytest
 
 logger = logging.getLogger(__name__)
 
-SERVICE_URL = "https://adk-spanner-agent-535816463745.us-central1.run.app"
+SERVICE_URL = os.environ.get("CLOUD_RUN_SERVICE_URL", "")
 A2A_ENDPOINT = f"{SERVICE_URL}/a2a/spanner_agent"
 
-# Service accounts representing users with different access levels
-SA_FULL_ACCESS = "user1-full-access@switon-gsd-demos.iam.gserviceaccount.com"
-SA_NO_ACCESS = "user2-no-access@switon-gsd-demos.iam.gserviceaccount.com"
-SA_FGAC = "user3-fgac@switon-gsd-demos.iam.gserviceaccount.com"
+# Service accounts representing users with different access levels — set via environment variables
+SA_FULL_ACCESS = os.environ.get("TEST_SA_FULL_ACCESS", "")
+SA_NO_ACCESS = os.environ.get("TEST_SA_NO_ACCESS", "")
+SA_FGAC = os.environ.get("TEST_SA_FGAC", "")
 
 
 def _get_identity_token() -> str:
