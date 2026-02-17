@@ -35,7 +35,14 @@ import google.cloud.spanner_v1.database
 import google.cloud.spanner_v1.instance
 import google.oauth2.credentials
 import httpx
-from google.cloud.spanner_admin_database_v1.types import DatabaseDialect
+from google.api_core.exceptions import NotFound as _NotFound
+from google.cloud.spanner_admin_database_v1.services.database_admin import (
+    DatabaseAdminClient as _DatabaseAdminClient,
+)
+from google.cloud.spanner_admin_database_v1.types import (
+    DatabaseDialect,
+    GetDatabaseDdlResponse as _GetDatabaseDdlResponse,
+)
 from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.tools.base_tool import BaseTool
 from google.adk.tools.base_toolset import BaseToolset, ToolPredicate
@@ -88,6 +95,9 @@ _current_bearer_token: contextvars.ContextVar[Optional[str]] = (
 )
 _current_database_role: contextvars.ContextVar[Optional[str]] = (
     contextvars.ContextVar("database_role", default=None)
+)
+_is_auth_managed: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "is_auth_managed", default=False
 )
 
 
@@ -144,14 +154,11 @@ _original_instance_database = _Instance.database
 def _patched_instance_database(self, database_id, *args, **kwargs):
     """Wrapper that injects ``database_role`` and pre-sets database dialect.
 
-    Injects the FGAC ``database_role`` from the ContextVar when set.
-
-    Pre-sets ``database_dialect`` to ``GOOGLE_STANDARD_SQL`` via the
-    constructor parameter.  Without this, the first access to
-    ``Database.database_dialect`` triggers ``reload()`` → ``getDdl``,
-    which requires ``spanner.databases.getDdl`` — a permission that
-    FGAC database roles typically lack.
+    Only active when ``_is_auth_managed`` is True.
     """
+    if not _is_auth_managed.get():
+        return _original_instance_database(self, database_id, *args, **kwargs)
+
     db_role = _current_database_role.get()
     if db_role and "database_role" not in kwargs:
         logger.info(
@@ -173,95 +180,28 @@ _Instance.database = _patched_instance_database
 
 
 # ---------------------------------------------------------------------------
-# Monkey-patch Database.database_dialect to avoid getDdl on every access
+# Monkey-patch Database.exists() to skip getDdl
 # ---------------------------------------------------------------------------
-# The upstream Spanner client's ``Database.database_dialect`` property calls
-# ``self.reload()`` whenever ``_database_dialect`` is
-# ``DATABASE_DIALECT_UNSPECIFIED``.  ``reload()`` triggers
-# ``get_database_ddl()`` which requires ``spanner.databases.getDdl`` — a
-# permission that user-scoped OAuth tokens and FGAC database roles typically
-# lack.
-#
-# The ``Instance.database()`` patch above pre-sets the dialect via the
-# constructor kwarg, but as a defence-in-depth measure we also patch the
-# *property* itself so that even if a ``Database`` object is created through
-# a path we don't control, the property never calls ``reload()``.
-_Database = google.cloud.spanner_v1.database.Database
-
-
-def _safe_database_dialect(self):
-    """Return the database dialect without triggering ``reload()``."""
-    if self._database_dialect == DatabaseDialect.DATABASE_DIALECT_UNSPECIFIED:
-        return DatabaseDialect.GOOGLE_STANDARD_SQL
-    return self._database_dialect
-
-
-_Database.database_dialect = property(_safe_database_dialect)
-
-
-# ---------------------------------------------------------------------------
-# Monkey-patch Database.reload() and Database.exists() to skip getDdl
-# ---------------------------------------------------------------------------
-# ``Database.reload()`` and ``Database.exists()`` both call
-# ``api.get_database_ddl()`` which requires ``spanner.databases.getDdl``.
-# User-scoped OAuth credentials and FGAC roles typically lack this.
-#
-# ``reload()`` is patched to only call ``get_database`` (requires the much
-# less privileged ``spanner.databases.get``), skipping ``get_database_ddl``.
+# ``Database.exists()`` calls ``api.get_database_ddl()`` which requires
+# ``spanner.databases.getDdl``. User-scoped credentials and FGAC roles typically
+# lack this.
 #
 # ``exists()`` is patched to use ``get_database`` instead of
 # ``get_database_ddl`` — same semantics (returns False on NotFound).
-from google.api_core.exceptions import NotFound as _NotFound
+_Database = google.cloud.spanner_v1.database.Database
+_original_exists = _Database.exists
 
 
-def _safe_reload(self):
-    """Reload database metadata without calling ``get_database_ddl()``.
-
-    The upstream ``reload()`` calls both ``get_database_ddl()`` and
-    ``get_database()``.  We skip the DDL call since it requires
-    ``spanner.databases.getDdl`` which user-scoped credentials lack.
-
-    Adapted from ``google-cloud-spanner`` v3.62.0
-    (``Database.reload`` in ``google/cloud/spanner_v1/database.py``).
-    If upgrading the library, verify this implementation still matches.
-    """
-    from google.cloud.spanner_v1.database import _metadata_with_prefix
-    from google.cloud.spanner_admin_database_v1.types import (
-        Database as DatabasePB,
-    )
-
-    api = self._instance._client.database_admin_api
-    metadata = _metadata_with_prefix(self.name)
-    response = api.get_database(
-        name=self.name,
-        metadata=self.metadata_with_request_id(
-            self._next_nth_request, 1, metadata
-        ),
-    )
-    self._state = DatabasePB.State(response.state)
-    self._create_time = response.create_time
-    self._restore_info = response.restore_info
-    self._version_retention_period = response.version_retention_period
-    self._earliest_version_time = response.earliest_version_time
-    self._encryption_config = response.encryption_config
-    self._encryption_info = response.encryption_info
-    self._default_leader = response.default_leader
-    if response.database_dialect != DatabaseDialect.DATABASE_DIALECT_UNSPECIFIED:
-        self._database_dialect = response.database_dialect
-    self._enable_drop_protection = response.enable_drop_protection
-    self._reconciling = response.reconciling
-
-
-_original_reload = _Database.reload
-_Database.reload = _safe_reload
-
-
-def _safe_exists(self):
+def _patched_exists(self):
     """Check database existence without calling ``get_database_ddl()``.
 
-    Uses ``get_database`` (requires ``spanner.databases.get``) instead
-    of ``get_database_ddl`` (requires ``spanner.databases.getDdl``).
+    Only active when ``_is_auth_managed`` is True.  Uses ``get_database``
+    (requires ``spanner.databases.get``) instead of ``get_database_ddl``
+    (requires ``spanner.databases.getDdl``).
     """
+    if not _is_auth_managed.get():
+        return _original_exists(self)
+
     from google.cloud.spanner_v1.database import _metadata_with_prefix
 
     api = self._instance._client.database_admin_api
@@ -278,8 +218,7 @@ def _safe_exists(self):
     return True
 
 
-_original_exists = _Database.exists
-_Database.exists = _safe_exists
+_Database.exists = _patched_exists
 
 
 # ---------------------------------------------------------------------------
@@ -294,29 +233,26 @@ _Database.exists = _safe_exists
 # This is intentionally the *last* patch so that the higher-level patches
 # (property, reload, exists) prevent most callers from ever reaching here,
 # and this layer catches anything that slips through.
-from google.cloud.spanner_admin_database_v1.services.database_admin import (
-    DatabaseAdminClient as _DatabaseAdminClient,
-)
-from google.cloud.spanner_admin_database_v1.types import (
-    GetDatabaseDdlResponse as _GetDatabaseDdlResponse,
-)
-
 _original_get_database_ddl = _DatabaseAdminClient.get_database_ddl
 
 
-def _blocked_get_database_ddl(self, *args, **kwargs):
+def _patched_get_database_ddl(self, *args, **kwargs):
     """Return an empty DDL response instead of calling the API.
 
-    This prevents ``spanner.databases.getDdl`` permission errors for
-    user-scoped OAuth credentials and FGAC database roles.
+    Only active when ``_is_auth_managed`` is True. This prevents
+    ``spanner.databases.getDdl`` permission errors for user-scoped
+    OAuth credentials and FGAC database roles.
     """
+    if not _is_auth_managed.get():
+        return _original_get_database_ddl(self, *args, **kwargs)
+
     logger.info(
         "[AUTH] Blocked get_database_ddl call (would require getDdl permission)"
     )
     return _GetDatabaseDdlResponse(statements=[])
 
 
-_DatabaseAdminClient.get_database_ddl = _blocked_get_database_ddl
+_DatabaseAdminClient.get_database_ddl = _patched_get_database_ddl
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +363,7 @@ class AuthTokenExtractorMiddleware:
 
         logger.info("[AUTH] Bearer token from %s (length=%d)", source, len(token))
         reset_token = set_bearer_token(token)
+        reset_managed = _is_auth_managed.set(True)
 
         # Resolve user email → FGAC database role
         db_role = None
@@ -442,6 +379,7 @@ class AuthTokenExtractorMiddleware:
         finally:
             _current_bearer_token.reset(reset_token)
             _current_database_role.reset(reset_role)
+            _is_auth_managed.reset(reset_managed)
 
 
 # ---------------------------------------------------------------------------
