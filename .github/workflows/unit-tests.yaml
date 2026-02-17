@@ -23,4 +23,4 @@ jobs:
         run: uv sync
 
       - name: Run tests
-        run: uv run python -m pytest tests/test_auth_wrapper.py -v
+        run: uv run python -m pytest tests/ --ignore=tests/integration -v
