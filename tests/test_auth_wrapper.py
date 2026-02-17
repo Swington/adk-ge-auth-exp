@@ -224,13 +224,11 @@ class TestBearerTokenCredentialsManager(unittest.TestCase):
 class TestBearerTokenSpannerToolset(unittest.TestCase):
     def setUp(self):
         creds = google.oauth2.credentials.Credentials("dummy_token")
-        self.auth_patcher = patch(
+        auth_patcher = patch(
             "google.auth.default", return_value=(creds, "test-project")
         )
-        self.auth_patcher.start()
-
-    def tearDown(self):
-        self.auth_patcher.stop()
+        auth_patcher.start()
+        self.addCleanup(auth_patcher.stop)
 
     @patch("spanner_agent.auth_wrapper.SpannerToolset")
     def test_get_tools_replaces_credentials_manager(self, mock_toolset_cls):
