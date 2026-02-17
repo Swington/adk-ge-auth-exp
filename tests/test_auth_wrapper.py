@@ -222,6 +222,16 @@ class TestBearerTokenCredentialsManager(unittest.TestCase):
 # BearerTokenSpannerToolset
 # --------------------------------------------------------------------------
 class TestBearerTokenSpannerToolset(unittest.TestCase):
+    def setUp(self):
+        creds = google.oauth2.credentials.Credentials("dummy_token")
+        self.auth_patcher = patch(
+            "google.auth.default", return_value=(creds, "test-project")
+        )
+        self.auth_patcher.start()
+
+    def tearDown(self):
+        self.auth_patcher.stop()
+
     @patch("spanner_agent.auth_wrapper.SpannerToolset")
     def test_get_tools_replaces_credentials_manager(self, mock_toolset_cls):
         mock_tool = MagicMock(spec=GoogleTool)
@@ -269,7 +279,15 @@ class TestBearerTokenSpannerToolset(unittest.TestCase):
 # End-to-end: middleware → credentials manager → tool
 # --------------------------------------------------------------------------
 class TestEndToEndBearerTokenFlow(unittest.TestCase):
+    def setUp(self):
+        creds = google.oauth2.credentials.Credentials("dummy_token")
+        self.auth_patcher = patch(
+            "google.auth.default", return_value=(creds, "test-project")
+        )
+        self.auth_patcher.start()
+
     def tearDown(self):
+        self.auth_patcher.stop()
         _current_bearer_token.set(None)
 
     @patch("spanner_agent.auth_wrapper.SpannerToolset")
