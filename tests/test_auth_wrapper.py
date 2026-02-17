@@ -12,23 +12,42 @@ Tests the auth pipeline:
 
 import asyncio
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import google.auth
+import google.oauth2.credentials
+from google.adk.tools.google_tool import GoogleTool
 from google.cloud.spanner_admin_database_v1.types import DatabaseDialect
 
 from spanner_agent.auth_wrapper import (
     AuthTokenExtractorMiddleware,
+    BearerTokenCredentialsManager,
+    BearerTokenSpannerToolset,
     _current_bearer_token,
     _current_database_role,
     _is_auth_managed,
+    _original_exists,
+    _original_get_database_ddl,
+    _original_instance_database,
+    _parse_key_value_env,
     _patched_exists,
     _patched_get_database_ddl,
     _patched_instance_database,
     get_bearer_token,
+    normalize_project_id_callback,
     set_bearer_token,
 )
 
+import google.cloud.spanner_v1.database
+
 FAKE_TOKEN = "test-fake-access-token-for-unit-testing-1234567890"
+
+
+def _make_tool_context(user_id: str) -> MagicMock:
+    ctx = MagicMock()
+    ctx.user_id = user_id
+    ctx.state = {}
+    return ctx
 
 
 def _run(coro):
@@ -97,10 +116,242 @@ class TestAuthTokenExtractorMiddleware(unittest.TestCase):
         _run(middleware(scope, None, None))
         self.assertEqual(captured["token"], "some_token")
 
+    def test_no_auth_header(self):
+        captured = {"token": "should_be_none"}
+
+        async def fake_app(scope, receive, send):
+            captured["token"] = get_bearer_token()
+
+        middleware = AuthTokenExtractorMiddleware(fake_app)
+        scope = {"type": "http", "headers": []}
+        _run(middleware(scope, None, None))
+        self.assertIsNone(captured["token"])
+
+    def test_non_bearer_auth_header(self):
+        captured = {"token": "should_be_none"}
+
+        async def fake_app(scope, receive, send):
+            captured["token"] = get_bearer_token()
+
+        middleware = AuthTokenExtractorMiddleware(fake_app)
+        scope = {
+            "type": "http",
+            "headers": [(b"authorization", b"Basic dXNlcjpwYXNz")],
+        }
+        _run(middleware(scope, None, None))
+        self.assertIsNone(captured["token"])
+
+    def test_non_http_scope_passes_through(self):
+        called = False
+
+        async def fake_app(scope, receive, send):
+            nonlocal called
+            called = True
+
+        middleware = AuthTokenExtractorMiddleware(fake_app)
+        scope = {"type": "websocket", "headers": []}
+        _run(middleware(scope, None, None))
+        self.assertTrue(called)
+
+    def test_x_user_authorization_takes_priority(self):
+        captured = {}
+
+        async def fake_app(scope, receive, send):
+            captured["token"] = get_bearer_token()
+
+        middleware = AuthTokenExtractorMiddleware(fake_app)
+        scope = {
+            "type": "http",
+            "headers": [
+                (b"authorization", b"Bearer identity-token-jwt"),
+                (b"x-user-authorization", f"Bearer {FAKE_TOKEN}".encode()),
+            ],
+        }
+        _run(middleware(scope, None, None))
+        self.assertEqual(captured["token"], FAKE_TOKEN)
+
+    def test_x_user_authorization_alone(self):
+        captured = {}
+
+        async def fake_app(scope, receive, send):
+            captured["token"] = get_bearer_token()
+
+        middleware = AuthTokenExtractorMiddleware(fake_app)
+        scope = {
+            "type": "http",
+            "headers": [
+                (b"x-user-authorization", f"Bearer {FAKE_TOKEN}".encode()),
+            ],
+        }
+        _run(middleware(scope, None, None))
+        self.assertEqual(captured["token"], FAKE_TOKEN)
+
+
+# --------------------------------------------------------------------------
+# BearerTokenCredentialsManager
+# --------------------------------------------------------------------------
+class TestBearerTokenCredentialsManager(unittest.TestCase):
+    def setUp(self):
+        self.manager = BearerTokenCredentialsManager()
+
+    def tearDown(self):
+        _current_bearer_token.set(None)
+
+    def test_returns_credentials_when_token_present(self):
+        set_bearer_token(FAKE_TOKEN)
+        ctx = _make_tool_context("user@example.com")
+        creds = _run(self.manager.get_valid_credentials(ctx))
+        self.assertIsNotNone(creds)
+        self.assertIsInstance(creds, google.oauth2.credentials.Credentials)
+        self.assertEqual(creds.token, FAKE_TOKEN)
+
+    def test_credentials_are_valid(self):
+        set_bearer_token(FAKE_TOKEN)
+        ctx = _make_tool_context("user@example.com")
+        creds = _run(self.manager.get_valid_credentials(ctx))
+        self.assertTrue(creds.valid)
+
+    def test_returns_none_when_no_token(self):
+        ctx = _make_tool_context("user@example.com")
+        creds = _run(self.manager.get_valid_credentials(ctx))
+        self.assertIsNone(creds)
+
+    def test_returns_none_when_empty_token(self):
+        set_bearer_token("")
+        ctx = _make_tool_context("user@example.com")
+        creds = _run(self.manager.get_valid_credentials(ctx))
+        self.assertIsNone(creds)
+
+
+# --------------------------------------------------------------------------
+# BearerTokenSpannerToolset
+# --------------------------------------------------------------------------
+class TestBearerTokenSpannerToolset(unittest.TestCase):
+    def setUp(self):
+        # ADC mock for SpannerToolset init
+        creds = google.oauth2.credentials.Credentials("dummy_token")
+        self.patcher = patch("google.auth.default", return_value=(creds, "project"))
+        self.patcher.start()
+
+    def tearDown(self):
+        self.patcher.stop()
+
+    @patch("spanner_agent.auth_wrapper.SpannerToolset")
+    def test_get_tools_replaces_credentials_manager(self, mock_toolset_cls):
+        mock_tool = MagicMock(spec=GoogleTool)
+        mock_tool._credentials_manager = MagicMock()
+        mock_tool.name = "spanner_list_table_names"
+
+        mock_toolset = MagicMock()
+        mock_toolset.get_tools = AsyncMock(return_value=[mock_tool])
+        mock_toolset_cls.return_value = mock_toolset
+
+        toolset = BearerTokenSpannerToolset()
+        tools = _run(toolset.get_tools())
+
+        self.assertEqual(len(tools), 1)
+        self.assertIsInstance(
+            tools[0]._credentials_manager, BearerTokenCredentialsManager
+        )
+
+    @patch("spanner_agent.auth_wrapper.SpannerToolset")
+    def test_get_tools_preserves_tool_name(self, mock_toolset_cls):
+        mock_tool = MagicMock(spec=GoogleTool)
+        mock_tool._credentials_manager = MagicMock()
+        mock_tool.name = "spanner_execute_sql"
+
+        mock_toolset = MagicMock()
+        mock_toolset.get_tools = AsyncMock(return_value=[mock_tool])
+        mock_toolset_cls.return_value = mock_toolset
+
+        toolset = BearerTokenSpannerToolset()
+        tools = _run(toolset.get_tools())
+        self.assertEqual(tools[0].name, "spanner_execute_sql")
+
+    @patch("spanner_agent.auth_wrapper.SpannerToolset")
+    def test_close_delegates(self, mock_toolset_cls):
+        mock_toolset = MagicMock()
+        mock_toolset.close = AsyncMock()
+        mock_toolset_cls.return_value = mock_toolset
+
+        toolset = BearerTokenSpannerToolset()
+        _run(toolset.close())
+        mock_toolset.close.assert_called_once()
+
+
+# --------------------------------------------------------------------------
+# End-to-end: middleware → credentials manager → tool
+# --------------------------------------------------------------------------
+class TestEndToEndBearerTokenFlow(unittest.TestCase):
+    def setUp(self):
+        creds = google.oauth2.credentials.Credentials("dummy_token")
+        self.patcher = patch("google.auth.default", return_value=(creds, "project"))
+        self.patcher.start()
+
+    def tearDown(self):
+        _current_bearer_token.set(None)
+        self.patcher.stop()
+
+    @patch("spanner_agent.auth_wrapper.SpannerToolset")
+    def test_middleware_to_credentials_manager(self, mock_toolset_cls):
+        """Bearer token from HTTP header reaches the credentials manager."""
+        mock_tool = MagicMock(spec=GoogleTool)
+        mock_tool._credentials_manager = MagicMock()
+        mock_tool.name = "spanner_execute_sql"
+
+        mock_toolset = MagicMock()
+        mock_toolset.get_tools = AsyncMock(return_value=[mock_tool])
+        mock_toolset_cls.return_value = mock_toolset
+
+        toolset = BearerTokenSpannerToolset()
+        tools = _run(toolset.get_tools())
+        creds_manager = tools[0]._credentials_manager
+
+        async def simulate_request():
+            reset = set_bearer_token(FAKE_TOKEN)
+            try:
+                ctx = _make_tool_context("user@example.com")
+                return await creds_manager.get_valid_credentials(ctx)
+            finally:
+                _current_bearer_token.reset(reset)
+
+        creds = _run(simulate_request())
+        self.assertIsNotNone(creds)
+        self.assertEqual(creds.token, FAKE_TOKEN)
+
+    @patch("spanner_agent.auth_wrapper.SpannerToolset")
+    def test_no_token_returns_none(self, mock_toolset_cls):
+        mock_tool = MagicMock(spec=GoogleTool)
+        mock_tool._credentials_manager = MagicMock()
+        mock_tool.name = "spanner_list_table_names"
+
+        mock_toolset = MagicMock()
+        mock_toolset.get_tools = AsyncMock(return_value=[mock_tool])
+        mock_toolset_cls.return_value = mock_toolset
+
+        toolset = BearerTokenSpannerToolset()
+        tools = _run(toolset.get_tools())
+
+        ctx = _make_tool_context("user@example.com")
+        creds = _run(tools[0]._credentials_manager.get_valid_credentials(ctx))
+        self.assertIsNone(creds)
+
 
 # --------------------------------------------------------------------------
 # FGAC: database_role ContextVar and Instance.database() patch
 # --------------------------------------------------------------------------
+class TestDatabaseRoleContextVar(unittest.TestCase):
+    def tearDown(self):
+        _current_database_role.set(None)
+
+    def test_default_is_none(self):
+        self.assertIsNone(_current_database_role.get())
+
+    def test_set_and_get(self):
+        _current_database_role.set("employees_reader")
+        self.assertEqual(_current_database_role.get(), "employees_reader")
+
+
 class TestPatchedInstanceDatabase(unittest.TestCase):
     def tearDown(self):
         _current_database_role.set(None)
@@ -138,6 +389,46 @@ class TestPatchedInstanceDatabase(unittest.TestCase):
             _patched_instance_database(mock_instance, "test-db")
 
         mock_orig.assert_called_once_with(mock_instance, "test-db")
+
+    def test_passes_dialect_kwarg(self):
+        """Passes database_dialect=GOOGLE_STANDARD_SQL to original method."""
+        _is_auth_managed.set(True)
+        mock_db = MagicMock()
+        mock_instance = MagicMock()
+
+        with patch(
+            "spanner_agent.auth_wrapper._original_instance_database",
+            return_value=mock_db,
+        ) as mock_orig:
+            _patched_instance_database(mock_instance, "test-db")
+
+        mock_orig.assert_called_once_with(
+            mock_instance,
+            "test-db",
+            database_dialect=DatabaseDialect.GOOGLE_STANDARD_SQL,
+        )
+
+    def test_preserves_explicit_dialect(self):
+        """If dialect is explicitly passed, don't override it."""
+        _is_auth_managed.set(True)
+        mock_db = MagicMock()
+        mock_instance = MagicMock()
+
+        with patch(
+            "spanner_agent.auth_wrapper._original_instance_database",
+            return_value=mock_db,
+        ) as mock_orig:
+            _patched_instance_database(
+                mock_instance,
+                "test-db",
+                database_dialect=DatabaseDialect.POSTGRESQL,
+            )
+
+        mock_orig.assert_called_once_with(
+            mock_instance,
+            "test-db",
+            database_dialect=DatabaseDialect.POSTGRESQL,
+        )
 
 
 # --------------------------------------------------------------------------
@@ -210,6 +501,88 @@ class TestPatchedGetDatabaseDdl(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
+# Project ID normalization
+# --------------------------------------------------------------------------
+class TestNormalizeProjectIdCallback(unittest.TestCase):
+    @patch.dict(
+        "spanner_agent.auth_wrapper._PROJECT_NUMBER_TO_ID",
+        {"111222333": "my-project"},
+        clear=True,
+    )
+    def test_normalizes_numeric_project_id(self):
+        tool = MagicMock()
+        tool.name = "spanner_list_table_names"
+        args = {"project_id": "111222333", "instance_id": "test-instance"}
+        ctx = _make_tool_context("user@example.com")
+
+        result = normalize_project_id_callback(tool, args, ctx)
+
+        self.assertIsNone(result)
+        self.assertEqual(args["project_id"], "my-project")
+
+    def test_passes_string_project_id_unchanged(self):
+        """Non-numeric project_id is passed through unchanged."""
+        tool = MagicMock()
+        tool.name = "spanner_execute_sql"
+        args = {"project_id": "my-project", "instance_id": "test-instance"}
+        ctx = _make_tool_context("user@example.com")
+
+        result = normalize_project_id_callback(tool, args, ctx)
+
+        self.assertIsNone(result)
+        self.assertEqual(args["project_id"], "my-project")
+
+    def test_no_project_id_args(self):
+        """When project_id is not in args, callback does nothing."""
+        tool = MagicMock()
+        tool.name = "some_tool"
+        args = {"query": "SELECT 1"}
+        ctx = _make_tool_context("user@example.com")
+
+        result = normalize_project_id_callback(tool, args, ctx)
+
+        self.assertIsNone(result)
+        self.assertNotIn("project_id", args)
+
+    def test_non_string_project_id_unchanged(self):
+        """Non-string project_id values are left unchanged."""
+        tool = MagicMock()
+        tool.name = "some_tool"
+        args = {"project_id": 12345}
+        ctx = _make_tool_context("user@example.com")
+
+        result = normalize_project_id_callback(tool, args, ctx)
+
+        self.assertIsNone(result)
+        self.assertEqual(args["project_id"], 12345)
+
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+class TestParseKeyValueEnv(unittest.TestCase):
+    def test_parses_single_pair(self):
+        result = _parse_key_value_env("111222333=my-project")
+        self.assertEqual(result, {"111222333": "my-project"})
+
+    def test_parses_multiple_pairs(self):
+        result = _parse_key_value_env("111=proj-a,222=proj-b")
+        self.assertEqual(result, {"111": "proj-a", "222": "proj-b"})
+
+    def test_returns_empty_dict_for_empty_string(self):
+        result = _parse_key_value_env("")
+        self.assertEqual(result, {})
+
+    def test_strips_whitespace(self):
+        result = _parse_key_value_env(" 111 = proj-a , 222 = proj-b ")
+        self.assertEqual(result, {"111": "proj-a", "222": "proj-b"})
+
+    def test_skips_malformed_entries(self):
+        result = _parse_key_value_env("111=proj-a,bad-entry,222=proj-b")
+        self.assertEqual(result, {"111": "proj-a", "222": "proj-b"})
+
+
+# --------------------------------------------------------------------------
 # Middleware and Database Role
 # --------------------------------------------------------------------------
 class TestMiddlewareDatabaseRole(unittest.TestCase):
@@ -241,6 +614,38 @@ class TestMiddlewareDatabaseRole(unittest.TestCase):
 
         self.assertEqual(captured["role"], "restricted_reader")
         self.assertTrue(captured["managed"])
+
+    @patch("spanner_agent.auth_wrapper._resolve_user_email")
+    def test_no_role_for_regular_user(self, mock_resolve):
+        mock_resolve.return_value = "regular-user@example.com"
+        captured = {"role": "should_be_none"}
+
+        async def fake_app(scope, receive, send):
+            captured["role"] = _current_database_role.get()
+
+        middleware = AuthTokenExtractorMiddleware(fake_app)
+        scope = {
+            "type": "http",
+            "headers": [(b"authorization", f"Bearer {FAKE_TOKEN}".encode())],
+        }
+        _run(middleware(scope, None, None))
+        self.assertIsNone(captured["role"])
+
+    @patch("spanner_agent.auth_wrapper._resolve_user_email")
+    def test_no_role_when_email_resolution_fails(self, mock_resolve):
+        mock_resolve.return_value = None
+        captured = {"role": "should_be_none"}
+
+        async def fake_app(scope, receive, send):
+            captured["role"] = _current_database_role.get()
+
+        middleware = AuthTokenExtractorMiddleware(fake_app)
+        scope = {
+            "type": "http",
+            "headers": [(b"authorization", f"Bearer {FAKE_TOKEN}".encode())],
+        }
+        _run(middleware(scope, None, None))
+        self.assertIsNone(captured["role"])
 
 
 if __name__ == "__main__":
