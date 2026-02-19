@@ -7,13 +7,14 @@ Tests the auth pipeline:
 4. BearerTokenSpannerToolset replaces _credentials_manager on tools
 5. FGAC database_role ContextVar and USER_DATABASE_ROLE_MAP
 6. Middleware sets database_role based on resolved email
+7. Conditional monkey patches (only active in managed context)
 """
 
 import asyncio
-import os
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import google.auth
 import google.oauth2.credentials
 from google.adk.tools.google_tool import GoogleTool
 from google.cloud.spanner_admin_database_v1.types import DatabaseDialect
@@ -22,18 +23,18 @@ from spanner_agent.auth_wrapper import (
     AuthTokenExtractorMiddleware,
     BearerTokenCredentialsManager,
     BearerTokenSpannerToolset,
-    _blocked_get_database_ddl,
     _current_bearer_token,
     _current_database_role,
+    _is_auth_managed,
     _original_exists,
     _original_get_database_ddl,
     _original_instance_database,
-    _original_reload,
     _parse_key_value_env,
+    _patched_exists,
+    _patched_get_database_ddl,
     _patched_instance_database,
-    _safe_exists,
-    _safe_reload,
     get_bearer_token,
+    normalize_project_id_callback,
     set_bearer_token,
 )
 
@@ -80,12 +81,14 @@ class TestContextVar(unittest.TestCase):
 class TestAuthTokenExtractorMiddleware(unittest.TestCase):
     def tearDown(self):
         _current_bearer_token.set(None)
+        _is_auth_managed.set(False)
 
     def test_extracts_bearer_token(self):
         captured = {}
 
         async def fake_app(scope, receive, send):
             captured["token"] = get_bearer_token()
+            captured["managed"] = _is_auth_managed.get()
 
         middleware = AuthTokenExtractorMiddleware(fake_app)
         scope = {
@@ -95,7 +98,9 @@ class TestAuthTokenExtractorMiddleware(unittest.TestCase):
         _run(middleware(scope, None, None))
 
         self.assertEqual(captured["token"], FAKE_TOKEN)
+        self.assertTrue(captured["managed"])
         self.assertIsNone(get_bearer_token())  # reset after request
+        self.assertFalse(_is_auth_managed.get())
 
     def test_case_insensitive_bearer(self):
         captured = {}
@@ -223,12 +228,13 @@ class TestBearerTokenCredentialsManager(unittest.TestCase):
 # --------------------------------------------------------------------------
 class TestBearerTokenSpannerToolset(unittest.TestCase):
     def setUp(self):
+        # ADC mock for SpannerToolset init
         creds = google.oauth2.credentials.Credentials("dummy_token")
-        auth_patcher = patch(
-            "google.auth.default", return_value=(creds, "test-project")
-        )
-        auth_patcher.start()
-        self.addCleanup(auth_patcher.stop)
+        self.patcher = patch("google.auth.default", return_value=(creds, "project"))
+        self.patcher.start()
+
+    def tearDown(self):
+        self.patcher.stop()
 
     @patch("spanner_agent.auth_wrapper.SpannerToolset")
     def test_get_tools_replaces_credentials_manager(self, mock_toolset_cls):
@@ -279,14 +285,12 @@ class TestBearerTokenSpannerToolset(unittest.TestCase):
 class TestEndToEndBearerTokenFlow(unittest.TestCase):
     def setUp(self):
         creds = google.oauth2.credentials.Credentials("dummy_token")
-        self.auth_patcher = patch(
-            "google.auth.default", return_value=(creds, "test-project")
-        )
-        self.auth_patcher.start()
+        self.patcher = patch("google.auth.default", return_value=(creds, "project"))
+        self.patcher.start()
 
     def tearDown(self):
-        self.auth_patcher.stop()
         _current_bearer_token.set(None)
+        self.patcher.stop()
 
     @patch("spanner_agent.auth_wrapper.SpannerToolset")
     def test_middleware_to_credentials_manager(self, mock_toolset_cls):
@@ -347,31 +351,48 @@ class TestDatabaseRoleContextVar(unittest.TestCase):
         _current_database_role.set("employees_reader")
         self.assertEqual(_current_database_role.get(), "employees_reader")
 
-    def test_patched_database_injects_role(self):
-        _current_database_role.set("employees_reader")
-        mock_instance = MagicMock()
-        _patched_instance_database(mock_instance, "test-db")
-        self.assertEqual(_current_database_role.get(), "employees_reader")
 
-    def test_patched_database_no_role_when_not_set(self):
-        _current_database_role.set(None)
-        self.assertIsNone(_current_database_role.get())
-
-
-class TestDatabaseDialectPreset(unittest.TestCase):
-    """Verify _patched_instance_database pre-sets database dialect.
-
-    The Spanner client's Database.database_dialect property triggers
-    reload() -> getDdl when dialect is UNSPECIFIED. FGAC database roles
-    don't have getDdl permission, so we pre-set the dialect to
-    GOOGLE_STANDARD_SQL via the constructor kwarg.
-    """
-
+class TestPatchedInstanceDatabase(unittest.TestCase):
     def tearDown(self):
         _current_database_role.set(None)
+        _is_auth_managed.set(False)
+
+    def test_patched_database_injects_role_and_dialect_when_managed(self):
+        _is_auth_managed.set(True)
+        _current_database_role.set("employees_reader")
+        mock_instance = MagicMock()
+        mock_db = MagicMock()
+
+        with patch(
+            "spanner_agent.auth_wrapper._original_instance_database",
+            return_value=mock_db,
+        ) as mock_orig:
+            _patched_instance_database(mock_instance, "test-db")
+
+        mock_orig.assert_called_once_with(
+            mock_instance,
+            "test-db",
+            database_role="employees_reader",
+            database_dialect=DatabaseDialect.GOOGLE_STANDARD_SQL,
+        )
+
+    def test_patched_database_calls_original_unchanged_when_not_managed(self):
+        _is_auth_managed.set(False)
+        _current_database_role.set("employees_reader")
+        mock_instance = MagicMock()
+        mock_db = MagicMock()
+
+        with patch(
+            "spanner_agent.auth_wrapper._original_instance_database",
+            return_value=mock_db,
+        ) as mock_orig:
+            _patched_instance_database(mock_instance, "test-db")
+
+        mock_orig.assert_called_once_with(mock_instance, "test-db")
 
     def test_passes_dialect_kwarg(self):
         """Passes database_dialect=GOOGLE_STANDARD_SQL to original method."""
+        _is_auth_managed.set(True)
         mock_db = MagicMock()
         mock_instance = MagicMock()
 
@@ -389,6 +410,7 @@ class TestDatabaseDialectPreset(unittest.TestCase):
 
     def test_preserves_explicit_dialect(self):
         """If dialect is explicitly passed, don't override it."""
+        _is_auth_managed.set(True)
         mock_db = MagicMock()
         mock_instance = MagicMock()
 
@@ -408,38 +430,86 @@ class TestDatabaseDialectPreset(unittest.TestCase):
             database_dialect=DatabaseDialect.POSTGRESQL,
         )
 
-    def test_dialect_preset_works_with_role_injection(self):
-        """Both dialect preset and role injection work together."""
-        _current_database_role.set("employees_reader")
-        mock_db = MagicMock()
-        mock_instance = MagicMock()
+
+# --------------------------------------------------------------------------
+# Database.exists() patch
+# --------------------------------------------------------------------------
+class TestPatchedExists(unittest.TestCase):
+    def tearDown(self):
+        _is_auth_managed.set(False)
+
+    def test_patched_exists_uses_get_database_when_managed(self):
+        _is_auth_managed.set(True)
+        db = MagicMock()
+        db.name = "projects/test/instances/test/databases/test"
+        db._next_nth_request = 1
+        mock_api = MagicMock()
+        db._instance._client.database_admin_api = mock_api
+
+        result = _patched_exists(db)
+
+        self.assertTrue(result)
+        mock_api.get_database.assert_called_once()
+        mock_api.get_database_ddl.assert_not_called()
+
+    def test_patched_exists_calls_original_when_not_managed(self):
+        _is_auth_managed.set(False)
+        db = MagicMock()
 
         with patch(
-            "spanner_agent.auth_wrapper._original_instance_database",
-            return_value=mock_db,
+            "spanner_agent.auth_wrapper._original_exists",
+            return_value=True,
         ) as mock_orig:
-            _patched_instance_database(mock_instance, "test-db")
+            result = _patched_exists(db)
 
-        mock_orig.assert_called_once_with(
-            mock_instance,
-            "test-db",
-            database_role="employees_reader",
-            database_dialect=DatabaseDialect.GOOGLE_STANDARD_SQL,
+        self.assertTrue(result)
+        mock_orig.assert_called_once_with(db)
+
+
+# --------------------------------------------------------------------------
+# DatabaseAdminClient.get_database_ddl patch
+# --------------------------------------------------------------------------
+class TestPatchedGetDatabaseDdl(unittest.TestCase):
+    def tearDown(self):
+        _is_auth_managed.set(False)
+
+    def test_patched_get_ddl_returns_empty_when_managed(self):
+        _is_auth_managed.set(True)
+        from google.cloud.spanner_admin_database_v1.types import (
+            GetDatabaseDdlResponse,
         )
 
+        mock_client = MagicMock()
+        result = _patched_get_database_ddl(mock_client, database="test-db")
 
+        self.assertIsInstance(result, GetDatabaseDdlResponse)
+        self.assertEqual(list(result.statements), [])
+        mock_client._transport.assert_not_called()
+
+    def test_patched_get_ddl_calls_original_when_not_managed(self):
+        _is_auth_managed.set(False)
+        mock_client = MagicMock()
+
+        with patch(
+            "spanner_agent.auth_wrapper._original_get_database_ddl",
+            return_value="original_resp",
+        ) as mock_orig:
+            result = _patched_get_database_ddl(mock_client, database="test-db")
+
+        self.assertEqual(result, "original_resp")
+        mock_orig.assert_called_once_with(mock_client, database="test-db")
+
+
+# --------------------------------------------------------------------------
+# Project ID normalization
+# --------------------------------------------------------------------------
 class TestNormalizeProjectIdCallback(unittest.TestCase):
-    """Verify before_tool_callback normalizes project numbers in tool args."""
-
     @patch.dict(
         "spanner_agent.auth_wrapper._PROJECT_NUMBER_TO_ID",
         {"111222333": "my-project"},
         clear=True,
     )
     def test_normalizes_numeric_project_id(self):
-        """Numeric project_id in tool args is replaced with string ID."""
-        from spanner_agent.auth_wrapper import normalize_project_id_callback
-
         tool = MagicMock()
         tool.name = "spanner_list_table_names"
         args = {"project_id": "111222333", "instance_id": "test-instance"}
@@ -452,8 +522,6 @@ class TestNormalizeProjectIdCallback(unittest.TestCase):
 
     def test_passes_string_project_id_unchanged(self):
         """Non-numeric project_id is passed through unchanged."""
-        from spanner_agent.auth_wrapper import normalize_project_id_callback
-
         tool = MagicMock()
         tool.name = "spanner_execute_sql"
         args = {"project_id": "my-project", "instance_id": "test-instance"}
@@ -464,10 +532,8 @@ class TestNormalizeProjectIdCallback(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(args["project_id"], "my-project")
 
-    def test_no_project_id_in_args(self):
+    def test_no_project_id_args(self):
         """When project_id is not in args, callback does nothing."""
-        from spanner_agent.auth_wrapper import normalize_project_id_callback
-
         tool = MagicMock()
         tool.name = "some_tool"
         args = {"query": "SELECT 1"}
@@ -480,8 +546,6 @@ class TestNormalizeProjectIdCallback(unittest.TestCase):
 
     def test_non_string_project_id_unchanged(self):
         """Non-string project_id values are left unchanged."""
-        from spanner_agent.auth_wrapper import normalize_project_id_callback
-
         tool = MagicMock()
         tool.name = "some_tool"
         args = {"project_id": 12345}
@@ -493,9 +557,10 @@ class TestNormalizeProjectIdCallback(unittest.TestCase):
         self.assertEqual(args["project_id"], 12345)
 
 
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
 class TestParseKeyValueEnv(unittest.TestCase):
-    """Verify _parse_key_value_env parses key=value environment variables."""
-
     def test_parses_single_pair(self):
         result = _parse_key_value_env("111222333=my-project")
         self.assertEqual(result, {"111222333": "my-project"})
@@ -517,139 +582,14 @@ class TestParseKeyValueEnv(unittest.TestCase):
         self.assertEqual(result, {"111": "proj-a", "222": "proj-b"})
 
 
-class TestDatabaseDialectPropertyPatch(unittest.TestCase):
-    """Verify Database.database_dialect property never triggers getDdl."""
-
-    def test_property_returns_google_standard_sql_when_unspecified(self):
-        """When _database_dialect is UNSPECIFIED, property returns GOOGLE_STANDARD_SQL."""
-        db = MagicMock(spec=google.cloud.spanner_v1.database.Database)
-        db._database_dialect = DatabaseDialect.DATABASE_DIALECT_UNSPECIFIED
-        result = google.cloud.spanner_v1.database.Database.database_dialect.fget(db)
-        self.assertEqual(result, DatabaseDialect.GOOGLE_STANDARD_SQL)
-
-    def test_property_returns_explicit_dialect_unchanged(self):
-        """When _database_dialect is explicitly set, property returns it unchanged."""
-        db = MagicMock(spec=google.cloud.spanner_v1.database.Database)
-        db._database_dialect = DatabaseDialect.GOOGLE_STANDARD_SQL
-        result = google.cloud.spanner_v1.database.Database.database_dialect.fget(db)
-        self.assertEqual(result, DatabaseDialect.GOOGLE_STANDARD_SQL)
-
-    def test_property_does_not_call_reload(self):
-        """The patched property never calls reload(), even when dialect is UNSPECIFIED."""
-        db = MagicMock(spec=google.cloud.spanner_v1.database.Database)
-        db._database_dialect = DatabaseDialect.DATABASE_DIALECT_UNSPECIFIED
-        google.cloud.spanner_v1.database.Database.database_dialect.fget(db)
-        db.reload.assert_not_called()
-
-
-class TestDatabaseReloadPatch(unittest.TestCase):
-    """Verify Database.reload() is patched to skip getDdl."""
-
-    def test_reload_is_patched(self):
-        """Database.reload is our _safe_reload, not the original."""
-        db_class = google.cloud.spanner_v1.database.Database
-        self.assertIs(db_class.reload, _safe_reload)
-        self.assertIsNot(db_class.reload, _original_reload)
-
-    def test_safe_reload_does_not_call_get_database_ddl(self):
-        """_safe_reload calls get_database but NOT get_database_ddl."""
-        from google.cloud.spanner_admin_database_v1.types import (
-            Database as DatabasePB,
-        )
-
-        db = MagicMock()
-        db.name = "projects/test/instances/test/databases/test"
-        db._next_nth_request = 1
-        mock_api = MagicMock()
-        mock_response = MagicMock()
-        mock_response.state = DatabasePB.State.READY
-        mock_response.database_dialect = DatabaseDialect.GOOGLE_STANDARD_SQL
-        mock_api.get_database.return_value = mock_response
-        db._instance._client.database_admin_api = mock_api
-
-        _safe_reload(db)
-
-        mock_api.get_database.assert_called_once()
-        mock_api.get_database_ddl.assert_not_called()
-
-
-class TestDatabaseExistsPatch(unittest.TestCase):
-    """Verify Database.exists() is patched to skip getDdl."""
-
-    def test_exists_is_patched(self):
-        """Database.exists is our _safe_exists, not the original."""
-        db_class = google.cloud.spanner_v1.database.Database
-        self.assertIs(db_class.exists, _safe_exists)
-        self.assertIsNot(db_class.exists, _original_exists)
-
-    def test_safe_exists_does_not_call_get_database_ddl(self):
-        """_safe_exists calls get_database but NOT get_database_ddl."""
-        db = MagicMock()
-        db.name = "projects/test/instances/test/databases/test"
-        db._next_nth_request = 1
-        mock_api = MagicMock()
-        db._instance._client.database_admin_api = mock_api
-
-        result = _safe_exists(db)
-
-        self.assertTrue(result)
-        mock_api.get_database.assert_called_once()
-        mock_api.get_database_ddl.assert_not_called()
-
-    def test_safe_exists_returns_false_on_not_found(self):
-        """_safe_exists returns False when database doesn't exist."""
-        from google.api_core.exceptions import NotFound
-
-        db = MagicMock()
-        db.name = "projects/test/instances/test/databases/nonexistent"
-        db._next_nth_request = 1
-        mock_api = MagicMock()
-        mock_api.get_database.side_effect = NotFound("not found")
-        db._instance._client.database_admin_api = mock_api
-
-        result = _safe_exists(db)
-
-        self.assertFalse(result)
-
-
-class TestGetDatabaseDdlBlocked(unittest.TestCase):
-    """Verify DatabaseAdminClient.get_database_ddl is blocked at the API level."""
-
-    def test_admin_client_method_is_patched(self):
-        """DatabaseAdminClient.get_database_ddl is our blocked version."""
-        from google.cloud.spanner_admin_database_v1.services.database_admin import (
-            DatabaseAdminClient,
-        )
-
-        self.assertIs(
-            DatabaseAdminClient.get_database_ddl, _blocked_get_database_ddl
-        )
-        self.assertIsNot(
-            DatabaseAdminClient.get_database_ddl, _original_get_database_ddl
-        )
-
-    def test_blocked_returns_empty_ddl_response(self):
-        """The blocked method returns GetDatabaseDdlResponse with empty statements."""
-        from google.cloud.spanner_admin_database_v1.types import (
-            GetDatabaseDdlResponse,
-        )
-
-        mock_client = MagicMock()
-        result = _blocked_get_database_ddl(mock_client, database="test-db")
-        self.assertIsInstance(result, GetDatabaseDdlResponse)
-        self.assertEqual(list(result.statements), [])
-
-    def test_blocked_never_calls_real_api(self):
-        """The blocked method does not make any API calls."""
-        mock_client = MagicMock()
-        _blocked_get_database_ddl(mock_client, database="test-db")
-        mock_client._transport.assert_not_called()
-
-
+# --------------------------------------------------------------------------
+# Middleware and Database Role
+# --------------------------------------------------------------------------
 class TestMiddlewareDatabaseRole(unittest.TestCase):
     def tearDown(self):
         _current_bearer_token.set(None)
         _current_database_role.set(None)
+        _is_auth_managed.set(False)
 
     @patch("spanner_agent.auth_wrapper._resolve_user_email")
     @patch.dict(
@@ -663,6 +603,7 @@ class TestMiddlewareDatabaseRole(unittest.TestCase):
 
         async def fake_app(scope, receive, send):
             captured["role"] = _current_database_role.get()
+            captured["managed"] = _is_auth_managed.get()
 
         middleware = AuthTokenExtractorMiddleware(fake_app)
         scope = {
@@ -672,7 +613,7 @@ class TestMiddlewareDatabaseRole(unittest.TestCase):
         _run(middleware(scope, None, None))
 
         self.assertEqual(captured["role"], "restricted_reader")
-        self.assertIsNone(_current_database_role.get())  # reset after
+        self.assertTrue(captured["managed"])
 
     @patch("spanner_agent.auth_wrapper._resolve_user_email")
     def test_no_role_for_regular_user(self, mock_resolve):
